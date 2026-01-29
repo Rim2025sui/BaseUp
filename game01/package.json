@@ -1,0 +1,25 @@
+{
+  "name": "game01",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.90.17",
+    "ether": "^0.0.9",
+    "ethers": "^6.16.0",
+    "next": "16.1.2",
+    "react": "19.2.3",
+    "react-dom": "19.2.3",
+    "viem": "^2.44.2",
+    "wagmi": "^3.3.2"
+  },
+  "devDependencies": {
+    "eslint": "^9",
+    "eslint-config-next": "16.1.2"
+  }
+}

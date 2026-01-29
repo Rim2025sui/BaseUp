@@ -1,0 +1,17 @@
+# secrets
+.env
+.env.*
+EVN/
+**/EVN/
+**/.env
+**/.env.*
+
+# deps/build
+node_modules/
+.next/
+out/
+dist/
+cache/
+artifacts/
+coverage/
+.DS_Store
