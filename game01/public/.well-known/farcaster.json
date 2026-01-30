@@ -1,0 +1,17 @@
+{
+  "accountAssociation": {
+    "header": "",
+    "payload": "",
+    "signature": ""
+  },
+  "frame": {
+    "version": "1",
+    "name": "BTC Guess",
+    "iconUrl": "https://base-up-eight.vercel.app/icon.png",
+    "homeUrl": "https://base-up-eight.vercel.app",
+    "imageUrl": "https://base-up-eight.vercel.app/og.png",
+    "buttonTitle": "Open",
+    "splashImageUrl": "https://base-up-eight.vercel.app/splash.png",
+    "splashBackgroundColor": "#0052FF"
+  }
+}
