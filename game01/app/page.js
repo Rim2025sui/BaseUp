@@ -414,196 +414,218 @@ export default function Page() {
   }
 
   return (
-    <main style={{ fontFamily: 'Arial, sans-serif', padding: 16, maxWidth: 980 }}>
-      <h2 style={{ marginBottom: 6 }}>Mini App: BTC Guess ({ACTIVE.chainName})</h2>
+    <div
+      style={{
+        minHeight: '100vh',
+        backgroundImage: "url('/bg.jpg')",
+        backgroundSize: 'cover',
+        backgroundPosition: 'center',
+        backgroundRepeat: 'no-repeat',
+      }}
+    >
+      <main
+        style={{
+          fontFamily: 'Arial, sans-serif',
+          padding: 16,
+          maxWidth: 980,
+          margin: '0 auto',
+          background: 'rgba(255,255,255,0.85)',
+          borderRadius: 16,
+          boxShadow: '0 8px 30px rgba(0,0,0,0.15)',
+        }}
+      >
+        <h2 style={{ marginBottom: 6 }}>Mini App: BTC Guess ({ACTIVE.chainName})</h2>
 
-      <div style={{ marginBottom: 8, color: '#444' }}>
-        Допустимые уровни: <b>{MIN_K}k</b> … <b>{MAX_K}k</b>
-      </div>
-
-      <div style={{ marginBottom: 10, color: '#444' }}>
-        Вводи число <b>{MIN_K}…{MAX_K}</b> (например: <b>69</b> = <b>69k</b> = <b>$69,000</b>). Попыток на раунд:{' '}
-        <b>{MAX_ATTEMPTS}</b>
-      </div>
-
-      <div style={{ marginBottom: 10 }}>
-        <div>
-          <b>Статус:</b> {status}
-          {isConnected && !isCorrectChain ? ' (не та сеть)' : ''}
-        </div>
-        <div style={{ wordBreak: 'break-all' }}>
-          <b>Адрес:</b> {addr || '-'}
-        </div>
-        <div>
-          <b>ChainId:</b> {chainId ?? '-'}
-        </div>
-        <div style={{ wordBreak: 'break-all' }}>
-          <b>Контракт:</b> {CONTRACT_ADDRESS}
-        </div>
-      </div>
-
-      <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 14 }}>
-        {!isConnected && (
-          <button style={{ padding: '10px 14px' }} onClick={connectWallet} disabled={!hasProvider}>
-            Подключить кошелёк
-          </button>
-        )}
-
-        {isConnected && !isCorrectChain && (
-          <button style={{ padding: '10px 14px' }} onClick={switchToMainnet}>
-            Switch to Base Mainnet
-          </button>
-        )}
-
-        <button style={{ padding: '10px 14px' }} onClick={resetRound}>
-          Новый раунд
-        </button>
-
-        <button
-          style={{ padding: '10px 14px' }}
-          onClick={saveOnchain}
-          disabled={!hasProvider || !lastWin || isSaving}
-          title={!lastWin ? 'Сначала выиграй раунд' : 'Записать победу onchain'}
-        >
-          {isSaving ? 'Сохраняю…' : 'Сохранить результат (onchain)'}
-        </button>
-
-        <button style={{ padding: '10px 14px' }} onClick={() => loadLeaderboard(true)} disabled={lbLoading}>
-          {lbLoading ? 'Обновляю…' : 'Обновить лидерборд'}
-        </button>
-      </div>
-
-      <div style={{ marginBottom: 10 }}>
-        <div style={{ marginBottom: 6 }}>
-          <b>Угадай уровень BTC (k):</b> введи <b>{MIN_K}…{MAX_K}</b>
+        <div style={{ marginBottom: 8, color: '#444' }}>
+          Допустимые уровни: <b>{MIN_K}k</b> … <b>{MAX_K}k</b>
         </div>
 
-        <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
-          <input
-            value={inputRaw}
-            onChange={onInputChange}
-            inputMode="numeric"
-            placeholder="например 69"
-            style={{ width: 180, padding: '10px 12px', fontSize: 16 }}
-            maxLength={3}
-          />
+        <div style={{ marginBottom: 10, color: '#444' }}>
+          Вводи число <b>{MIN_K}…{MAX_K}</b> (например: <b>69</b> = <b>69k</b> = <b>$69,000</b>). Попыток на
+          раунд: <b>{MAX_ATTEMPTS}</b>
+        </div>
 
-          <button style={{ padding: '10px 14px' }} onClick={guessNow}>
-            Проверить
-          </button>
-
-          <div style={{ color: '#333' }}>
-            {interpretedK !== null ? (
-              <span>
-                Интерпретируется как <b>{interpretedLabel}</b> (<b>${interpretedUsd?.toLocaleString('en-US')}</b>)
-              </span>
-            ) : (
-              <span style={{ color: '#777' }}>Введите число (2–3 цифры)</span>
-            )}
-          </div>
-        </div>
-      </div>
-
-      <div style={{ marginBottom: 12 }}>
-        <b>Подсказка:</b> <span style={{ marginLeft: 8 }}>{hint || '-'}</span>
-      </div>
-
-      <div style={{ marginBottom: 12 }}>
-        <div>
-          Попыток (в этом раунде): <b>{attemptsThisRound}</b> / {MAX_ATTEMPTS}
-        </div>
-        <div>
-          Раунды: <b>{rounds}</b>
-        </div>
-        <div>
-          Победы: <b>{wins}</b>
-        </div>
-        <div>
-          Очки за последнюю победу: <b>{lastRoundScore}</b>
-        </div>
-        <div>
-          Лучший результат за раунд: <b>{bestRoundScore}</b>
-        </div>
-        <div>
-          Суммарные очки (total): <b>{totalScore}</b>
-        </div>
-      </div>
-
-      <div style={{ padding: 12, border: '1px solid #ddd', borderRadius: 10, marginBottom: 14 }}>
-        <div style={{ marginBottom: 6 }}>
-          <b>Последняя победа (для onchain):</b>
-        </div>
-        {lastWin ? (
+        <div style={{ marginBottom: 10 }}>
           <div>
-            <div>
-              guess: <b>{lastWin.guessK}k</b>
-            </div>
-            <div>
-              score: <b>{lastWin.score}</b>
-            </div>
-            <div style={{ wordBreak: 'break-all' }}>
-              saved tx: <b>{lastSavedTx ? lastSavedTx : '-'}</b>
-            </div>
+            <b>Статус:</b> {status}
+            {isConnected && !isCorrectChain ? ' (не та сеть)' : ''}
           </div>
-        ) : (
-          <div style={{ color: '#666' }}>Пока нет победы.</div>
-        )}
-      </div>
-
-      <div style={{ padding: 12, border: '1px solid #ddd', borderRadius: 10 }}>
-        <div style={{ marginBottom: 6 }}>
-          <b>Leaderboard (onchain)</b>
+          <div style={{ wordBreak: 'break-all' }}>
+            <b>Адрес:</b> {addr || '-'}
+          </div>
+          <div>
+            <b>ChainId:</b> {chainId ?? '-'}
+          </div>
+          <div style={{ wordBreak: 'break-all' }}>
+            <b>Контракт:</b> {CONTRACT_ADDRESS}
+          </div>
         </div>
 
-        {lbInfo && <div style={{ color: '#666', marginBottom: 8 }}>{lbInfo}</div>}
+        <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 14 }}>
+          {!isConnected && (
+            <button style={{ padding: '10px 14px' }} onClick={connectWallet} disabled={!hasProvider}>
+              Подключить кошелёк
+            </button>
+          )}
 
-        {lbRows.length > 0 && (
-          <div style={{ overflowX: 'auto' }}>
-            <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-              <thead>
-                <tr>
-                  <th style={{ textAlign: 'left', borderBottom: '1px solid #eee', padding: 8 }}>#</th>
-                  <th style={{ textAlign: 'left', borderBottom: '1px solid #eee', padding: 8 }}>Address</th>
-                  <th style={{ textAlign: 'left', borderBottom: '1px solid #eee', padding: 8 }}>Best score</th>
-                  <th style={{ textAlign: 'left', borderBottom: '1px solid #eee', padding: 8 }}>Guess</th>
-                </tr>
-              </thead>
-              <tbody>
-                {lbRows.map((r, i) => (
-                  <tr key={`${r.user}-${i}`}>
-                    <td style={{ borderBottom: '1px solid #f2f2f2', padding: 8 }}>{i + 1}</td>
-                    <td style={{ borderBottom: '1px solid #f2f2f2', padding: 8, wordBreak: 'break-all' }}>{r.user}</td>
-                    <td style={{ borderBottom: '1px solid #f2f2f2', padding: 8 }}>
-                      <b>{r.score}</b>
-                    </td>
-                    <td style={{ borderBottom: '1px solid #f2f2f2', padding: 8 }}>{r.guessK}k</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+          {isConnected && !isCorrectChain && (
+            <button style={{ padding: '10px 14px' }} onClick={switchToMainnet}>
+              Switch to Base Mainnet
+            </button>
+          )}
+
+          <button style={{ padding: '10px 14px' }} onClick={resetRound}>
+            Новый раунд
+          </button>
+
+          <button
+            style={{ padding: '10px 14px' }}
+            onClick={saveOnchain}
+            disabled={!hasProvider || !lastWin || isSaving}
+            title={!lastWin ? 'Сначала выиграй раунд' : 'Записать победу onchain'}
+          >
+            {isSaving ? 'Сохраняю…' : 'Сохранить результат (onchain)'}
+          </button>
+
+          <button style={{ padding: '10px 14px' }} onClick={() => loadLeaderboard(true)} disabled={lbLoading}>
+            {lbLoading ? 'Обновляю…' : 'Обновить лидерборд'}
+          </button>
+        </div>
+
+        <div style={{ marginBottom: 10 }}>
+          <div style={{ marginBottom: 6 }}>
+            <b>Угадай уровень BTC (k):</b> введи <b>{MIN_K}…{MAX_K}</b>
           </div>
-        )}
-      </div>
 
-      {txMsg && (
-        <div style={{ marginTop: 12 }}>
-          <b>Onchain:</b> {txMsg}
-          {txHash && (
-            <div style={{ wordBreak: 'break-all', marginTop: 6 }}>
-              <b>Tx:</b>{' '}
-              <a href={`${ACTIVE.blockExplorerUrls[0]}/tx/${txHash}`} target="_blank" rel="noreferrer">
-                {txHash}
-              </a>
+          <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+            <input
+              value={inputRaw}
+              onChange={onInputChange}
+              inputMode="numeric"
+              placeholder="например 69"
+              style={{ width: 180, padding: '10px 12px', fontSize: 16 }}
+              maxLength={3}
+            />
+
+            <button style={{ padding: '10px 14px' }} onClick={guessNow}>
+              Проверить
+            </button>
+
+            <div style={{ color: '#333' }}>
+              {interpretedK !== null ? (
+                <span>
+                  Интерпретируется как <b>{interpretedLabel}</b> (<b>${interpretedUsd?.toLocaleString('en-US')}</b>)
+                </span>
+              ) : (
+                <span style={{ color: '#777' }}>Введите число (2–3 цифры)</span>
+              )}
+            </div>
+          </div>
+        </div>
+
+        <div style={{ marginBottom: 12 }}>
+          <b>Подсказка:</b> <span style={{ marginLeft: 8 }}>{hint || '-'}</span>
+        </div>
+
+        <div style={{ marginBottom: 12 }}>
+          <div>
+            Попыток (в этом раунде): <b>{attemptsThisRound}</b> / {MAX_ATTEMPTS}
+          </div>
+          <div>
+            Раунды: <b>{rounds}</b>
+          </div>
+          <div>
+            Победы: <b>{wins}</b>
+          </div>
+          <div>
+            Очки за последнюю победу: <b>{lastRoundScore}</b>
+          </div>
+          <div>
+            Лучший результат за раунд: <b>{bestRoundScore}</b>
+          </div>
+          <div>
+            Суммарные очки (total): <b>{totalScore}</b>
+          </div>
+        </div>
+
+        <div style={{ padding: 12, border: '1px solid #ddd', borderRadius: 10, marginBottom: 14 }}>
+          <div style={{ marginBottom: 6 }}>
+            <b>Последняя победа (для onchain):</b>
+          </div>
+          {lastWin ? (
+            <div>
+              <div>
+                guess: <b>{lastWin.guessK}k</b>
+              </div>
+              <div>
+                score: <b>{lastWin.score}</b>
+              </div>
+              <div style={{ wordBreak: 'break-all' }}>
+                saved tx: <b>{lastSavedTx ? lastSavedTx : '-'}</b>
+              </div>
+            </div>
+          ) : (
+            <div style={{ color: '#666' }}>Пока нет победы.</div>
+          )}
+        </div>
+
+        <div style={{ padding: 12, border: '1px solid #ddd', borderRadius: 10 }}>
+          <div style={{ marginBottom: 6 }}>
+            <b>Leaderboard (onchain)</b>
+          </div>
+
+          {lbInfo && <div style={{ color: '#666', marginBottom: 8 }}>{lbInfo}</div>}
+
+          {lbRows.length > 0 && (
+            <div style={{ overflowX: 'auto' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                <thead>
+                  <tr>
+                    <th style={{ textAlign: 'left', borderBottom: '1px solid #eee', padding: 8 }}>#</th>
+                    <th style={{ textAlign: 'left', borderBottom: '1px solid #eee', padding: 8 }}>Address</th>
+                    <th style={{ textAlign: 'left', borderBottom: '1px solid #eee', padding: 8 }}>Best score</th>
+                    <th style={{ textAlign: 'left', borderBottom: '1px solid #eee', padding: 8 }}>Guess</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {lbRows.map((r, i) => (
+                    <tr key={`${r.user}-${i}`}>
+                      <td style={{ borderBottom: '1px solid #f2f2f2', padding: 8 }}>{i + 1}</td>
+                      <td style={{ borderBottom: '1px solid #f2f2f2', padding: 8, wordBreak: 'break-all' }}>
+                        {r.user}
+                      </td>
+                      <td style={{ borderBottom: '1px solid #f2f2f2', padding: 8 }}>
+                        <b>{r.score}</b>
+                      </td>
+                      <td style={{ borderBottom: '1px solid #f2f2f2', padding: 8 }}>{r.guessK}k</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             </div>
           )}
         </div>
-      )}
 
-      {err && (
-        <div style={{ marginTop: 12, color: 'crimson', whiteSpace: 'pre-wrap' }}>
-          <b>Ошибка:</b> {err}
-        </div>
-      )}
-    </main>
+        {txMsg && (
+          <div style={{ marginTop: 12 }}>
+            <b>Onchain:</b> {txMsg}
+            {txHash && (
+              <div style={{ wordBreak: 'break-all', marginTop: 6 }}>
+                <b>Tx:</b>{' '}
+                <a href={`${ACTIVE.blockExplorerUrls[0]}/tx/${txHash}`} target="_blank" rel="noreferrer">
+                  {txHash}
+                </a>
+              </div>
+            )}
+          </div>
+        )}
+
+        {err && (
+          <div style={{ marginTop: 12, color: 'crimson', whiteSpace: 'pre-wrap' }}>
+            <b>Ошибка:</b> {err}
+          </div>
+        )}
+      </main>
+    </div>
   );
 }
