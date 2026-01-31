@@ -2,6 +2,7 @@
 
 import React, { useEffect, useMemo, useState } from 'react';
 import { ethers } from 'ethers';
+import { sdk } from '@farcaster/frame-sdk';
 
 // === SETTINGS ===
 const MIN_K = 60;
@@ -219,6 +220,14 @@ export default function Page() {
 
     refreshWalletState();
 
+    // ✅ Farcaster / Mini App: снимаем заставку (иначе будет "готов, но не вызван")
+    try {
+      sdk.actions.ready();
+    } catch (e) {
+      // если открыто не в mini app окружении — просто игнорим
+      console.log('sdk.actions.ready() skipped:', e);
+    }
+
     return () => {
       eth.removeListener?.('accountsChanged', onAccountsChanged);
       eth.removeListener?.('chainChanged', onChainChanged);
@@ -352,7 +361,9 @@ export default function Page() {
       const d = await diagnose(provider);
 
       if (d.currentChainId !== ACTIVE.chainIdDec) {
-        return setErr(`Не та сеть. Сейчас chainId=${d.currentChainId}. Нужна ${ACTIVE.chainName} (${ACTIVE.chainIdDec}). Нажми "Switch to Base Mainnet".`);
+        return setErr(
+          `Не та сеть. Сейчас chainId=${d.currentChainId}. Нужна ${ACTIVE.chainName} (${ACTIVE.chainIdDec}). Нажми "Switch to Base Mainnet".`
+        );
       }
 
       if (!d.isContract) {
@@ -376,7 +387,7 @@ export default function Page() {
       let gasLimit = 180000n;
       try {
         const est = await contract.played.estimateGas(BigInt(lastWin.score), BigInt(lastWin.guessK));
-        gasLimit = est + (est / 4n);
+        gasLimit = est + est / 4n;
       } catch (ge) {
         console.error('estimateGas error', ge);
         gasLimit = 200000n;
@@ -411,7 +422,8 @@ export default function Page() {
       </div>
 
       <div style={{ marginBottom: 10, color: '#444' }}>
-        Вводи число <b>{MIN_K}…{MAX_K}</b> (например: <b>69</b> = <b>69k</b> = <b>$69,000</b>). Попыток на раунд: <b>{MAX_ATTEMPTS}</b>
+        Вводи число <b>{MIN_K}…{MAX_K}</b> (например: <b>69</b> = <b>69k</b> = <b>$69,000</b>). Попыток на раунд:{' '}
+        <b>{MAX_ATTEMPTS}</b>
       </div>
 
       <div style={{ marginBottom: 10 }}>
