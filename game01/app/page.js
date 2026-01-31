@@ -220,11 +220,9 @@ export default function Page() {
 
     refreshWalletState();
 
-    // ✅ Farcaster / Mini App: снимаем заставку (иначе будет "готов, но не вызван")
     try {
       sdk.actions.ready();
     } catch (e) {
-      // если открыто не в mini app окружении — просто игнорим
       console.log('sdk.actions.ready() skipped:', e);
     }
 
@@ -418,20 +416,24 @@ export default function Page() {
       style={{
         minHeight: '100vh',
         backgroundImage: "url('/bg.jpg')",
-        backgroundSize: 'cover',
-        backgroundPosition: 'center',
         backgroundRepeat: 'no-repeat',
+        backgroundPosition: 'top center',
+        backgroundSize: 'contain', // ✅ чтобы НЕ обрезало BTC/ETH и было как на картинке
+        backgroundColor: '#061a33', // ✅ чтобы вокруг не было белых полос, если экран другой пропорции
+        padding: 16,
+        display: 'flex',
+        justifyContent: 'center',
       }}
     >
       <main
         style={{
           fontFamily: 'Arial, sans-serif',
-          padding: 16,
+          width: '100%',
           maxWidth: 980,
-          margin: '0 auto',
-          background: 'rgba(255,255,255,0.85)',
+          background: 'rgba(255,255,255,0.92)', // ✅ читаемость, но фон остаётся ярким
           borderRadius: 16,
-          boxShadow: '0 8px 30px rgba(0,0,0,0.15)',
+          padding: 16,
+          boxShadow: '0 8px 28px rgba(0,0,0,0.25)',
         }}
       >
         <h2 style={{ marginBottom: 6 }}>Mini App: BTC Guess ({ACTIVE.chainName})</h2>
@@ -441,8 +443,10 @@ export default function Page() {
         </div>
 
         <div style={{ marginBottom: 10, color: '#444' }}>
-          Вводи число <b>{MIN_K}…{MAX_K}</b> (например: <b>69</b> = <b>69k</b> = <b>$69,000</b>). Попыток на
-          раунд: <b>{MAX_ATTEMPTS}</b>
+          Вводи число <b>
+            {MIN_K}…{MAX_K}
+          </b>{' '}
+          (например: <b>69</b> = <b>69k</b> = <b>$69,000</b>). Попыток на раунд: <b>{MAX_ATTEMPTS}</b>
         </div>
 
         <div style={{ marginBottom: 10 }}>
@@ -494,7 +498,9 @@ export default function Page() {
 
         <div style={{ marginBottom: 10 }}>
           <div style={{ marginBottom: 6 }}>
-            <b>Угадай уровень BTC (k):</b> введи <b>{MIN_K}…{MAX_K}</b>
+            <b>Угадай уровень BTC (k):</b> введи <b>
+              {MIN_K}…{MAX_K}
+            </b>
           </div>
 
           <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
