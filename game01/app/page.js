@@ -21,7 +21,7 @@ const BASE_MAINNET = {
 
 const ACTIVE = BASE_MAINNET;
 
-// ✅ адрес берём из .env.local (а не хардкод)
+// ✅ адрес и rpc берём из .env.local (а не хардкод)
 const CONTRACT_ADDRESS =
   process.env.NEXT_PUBLIC_CONTRACT_ADDRESS || '0x085439394e6FEac14FFB61134ba8F81fA8A9f314';
 
@@ -51,10 +51,48 @@ function formatError(e) {
   }
 }
 
+// --- PROFILE HELPERS ---
 function shortAddr(a) {
-  if (!a || typeof a !== 'string') return '';
-  if (a.length < 10) return a;
-  return `${a.slice(0, 6)}…${a.slice(-4)}`;
+  return a ? `${a.slice(0, 6)}…${a.slice(-4)}` : '-';
+}
+
+// Лёгкий blockies-аватар без зависимостей (canvas→dataURL)
+function addrToAvatar(address, size = 6, scale = 8) {
+  if (!address) return null;
+
+  let seed = 0;
+  for (let i = 0; i < address.length; i++) seed = (seed * 31 + address.charCodeAt(i)) >>> 0;
+  const rand = () => ((seed = (seed * 1103515245 + 12345) >>> 0) / 2 ** 32);
+
+  const canvas = document.createElement('canvas');
+  const N = size * scale;
+  canvas.width = N;
+  canvas.height = N;
+  const ctx = canvas.getContext('2d');
+
+  ctx.fillStyle = '#eef3f9';
+  ctx.fillRect(0, 0, N, N);
+
+  const baseHue = Math.floor(rand() * 360);
+  const fg = `hsl(${baseHue},70%,45%)`;
+  const bg = `hsl(${(baseHue + 180) % 360},60%,92%)`;
+
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, N, N);
+  ctx.fillStyle = fg;
+
+  const cells = 5;
+  for (let y = 0; y < cells; y++) {
+    for (let x = 0; x < Math.ceil(cells / 2); x++) {
+      const on = rand() > 0.5;
+      if (on) {
+        ctx.fillRect(x * scale, y * scale, scale, scale);
+        ctx.fillRect((cells - 1 - x) * scale, y * scale, scale, scale);
+      }
+    }
+  }
+
+  return canvas.toDataURL('image/png');
 }
 
 export default function Page() {
@@ -65,12 +103,9 @@ export default function Page() {
   const [chainId, setChainId] = useState(null);
   const [status, setStatus] = useState('Не подключено');
 
-  // user profile (avatar + display name)
-  const [profile, setProfile] = useState({
-    displayName: '',
-    username: '',
-    pfpUrl: '',
-  });
+  // profile (avatar + display name)
+  const [profileName, setProfileName] = useState('-');
+  const [profileAvatar, setProfileAvatar] = useState(null);
 
   // game
   const [targetK, setTargetK] = useState(() => randomInt(MIN_K, MAX_K));
@@ -157,9 +192,20 @@ export default function Page() {
       if (connected) {
         setAddr(accounts[0]);
         setStatus('Подключено');
+
+        // profile (пока: короткий адрес + blockies)
+        const nice = shortAddr(accounts[0]);
+        setProfileName(nice);
+        try {
+          setProfileAvatar(addrToAvatar(accounts[0]));
+        } catch {
+          setProfileAvatar(null);
+        }
       } else {
         setAddr('');
         setStatus('Не подключено');
+        setProfileName('-');
+        setProfileAvatar(null);
       }
 
       const cidHex = await eth.request({ method: 'eth_chainId' });
@@ -238,23 +284,6 @@ export default function Page() {
     } catch (e) {
       console.log('sdk.actions.ready() skipped:', e);
     }
-
-    // try to read user context (Base App / Farcaster)
-    (async () => {
-      try {
-        const ctx = await sdk.context;
-        const u = ctx?.user || ctx?.untrustedData?.user;
-        if (u) {
-          setProfile({
-            displayName: u.displayName || u.name || '',
-            username: u.username || '',
-            pfpUrl: u.pfpUrl || u.pfp || u.avatarUrl || '',
-          });
-        }
-      } catch {
-        // no context -> fallback to addr
-      }
-    })();
 
     return () => {
       eth.removeListener?.('accountsChanged', onAccountsChanged);
@@ -441,9 +470,6 @@ export default function Page() {
     }
   }
 
-  const displayMainName =
-    profile.displayName || (profile.username ? `@${profile.username}` : addr ? shortAddr(addr) : '-');
-
   return (
     <div
       style={{
@@ -476,51 +502,54 @@ export default function Page() {
         </div>
 
         <div style={{ marginBottom: 10, color: '#444' }}>
-          Вводи число <b>
-            {MIN_K}…{MAX_K}
-          </b>{' '}
-          (например: <b>69</b> = <b>69k</b> = <b>$69,000</b>). Попыток на раунд: <b>{MAX_ATTEMPTS}</b>
+          Вводи число <b>{MIN_K}…{MAX_K}</b> (например: <b>69</b> = <b>69k</b> = <b>$69,000</b>). Попыток на раунд:{' '}
+          <b>{MAX_ATTEMPTS}</b>
         </div>
 
+        {/* PROFILE CARD */}
+        <div
+          style={{
+            marginBottom: 12,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 12,
+            padding: 10,
+            border: '1px solid #e5e7eb',
+            borderRadius: 12,
+            background: '#fafbff',
+          }}
+        >
+          <div
+            style={{
+              width: 44,
+              height: 44,
+              borderRadius: '50%',
+              overflow: 'hidden',
+              border: '1px solid #e5e7eb',
+              background: '#fff',
+              flex: '0 0 44px',
+            }}
+          >
+            {profileAvatar ? (
+              <img src={profileAvatar} alt="avatar" style={{ width: '100%', height: '100%' }} />
+            ) : (
+              <div style={{ width: '100%', height: '100%', background: '#eef3f9' }} />
+            )}
+          </div>
+
+          <div style={{ lineHeight: 1.25, width: '100%' }}>
+            <div style={{ fontWeight: 700 }}>{profileName}</div>
+            <div style={{ fontSize: 12, color: '#666' }}>
+              {status}
+              {isConnected && !isCorrectChain ? ' · не та сеть' : ''}
+            </div>
+            <div style={{ fontSize: 12, color: '#8b8b8b', wordBreak: 'break-all' }}>{addr ? shortAddr(addr) : '-'}</div>
+          </div>
+        </div>
+
+        {/* TECH INFO */}
         <div style={{ marginBottom: 10 }}>
           <div>
-            <b>Статус:</b> {status}
-            {isConnected && !isCorrectChain ? ' (не та сеть)' : ''}
-          </div>
-
-          {/* ✅ PROFILE BLOCK вместо сырого адреса */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 6 }}>
-            {profile.pfpUrl ? (
-              <img
-                src={profile.pfpUrl}
-                alt="avatar"
-                width={38}
-                height={38}
-                style={{ borderRadius: 999, objectFit: 'cover', border: '1px solid #ddd' }}
-                referrerPolicy="no-referrer"
-              />
-            ) : (
-              <div
-                style={{
-                  width: 38,
-                  height: 38,
-                  borderRadius: 999,
-                  background: '#e9eef6',
-                  border: '1px solid #ddd',
-                }}
-              />
-            )}
-
-            <div style={{ lineHeight: 1.1 }}>
-              <div style={{ fontWeight: 700 }}>{displayMainName}</div>
-              <div style={{ color: '#666', fontSize: 12, wordBreak: 'break-all' }}>
-                {profile.username ? `@${profile.username}` : ''}
-                {addr ? (profile.username ? ` · ${shortAddr(addr)}` : shortAddr(addr)) : ''}
-              </div>
-            </div>
-          </div>
-
-          <div style={{ marginTop: 6 }}>
             <b>ChainId:</b> {chainId ?? '-'}
           </div>
           <div style={{ wordBreak: 'break-all' }}>
@@ -561,9 +590,7 @@ export default function Page() {
 
         <div style={{ marginBottom: 10 }}>
           <div style={{ marginBottom: 6 }}>
-            <b>Угадай уровень BTC (k):</b> введи <b>
-              {MIN_K}…{MAX_K}
-            </b>
+            <b>Угадай уровень BTC (k):</b> введи <b>{MIN_K}…{MAX_K}</b>
           </div>
 
           <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
@@ -651,7 +678,7 @@ export default function Page() {
                 <thead>
                   <tr>
                     <th style={{ textAlign: 'left', borderBottom: '1px solid #eee', padding: 8 }}>#</th>
-                    <th style={{ textAlign: 'left', borderBottom: '1px solid #eee', padding: 8 }}>User</th>
+                    <th style={{ textAlign: 'left', borderBottom: '1px solid #eee', padding: 8 }}>Address</th>
                     <th style={{ textAlign: 'left', borderBottom: '1px solid #eee', padding: 8 }}>Best score</th>
                     <th style={{ textAlign: 'left', borderBottom: '1px solid #eee', padding: 8 }}>Guess</th>
                   </tr>
@@ -660,9 +687,7 @@ export default function Page() {
                   {lbRows.map((r, i) => (
                     <tr key={`${r.user}-${i}`}>
                       <td style={{ borderBottom: '1px solid #f2f2f2', padding: 8 }}>{i + 1}</td>
-                      <td style={{ borderBottom: '1px solid #f2f2f2', padding: 8, wordBreak: 'break-all' }}>
-                        {shortAddr(r.user)}
-                      </td>
+                      <td style={{ borderBottom: '1px solid #f2f2f2', padding: 8, wordBreak: 'break-all' }}>{r.user}</td>
                       <td style={{ borderBottom: '1px solid #f2f2f2', padding: 8 }}>
                         <b>{r.score}</b>
                       </td>
