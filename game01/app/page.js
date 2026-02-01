@@ -2,337 +2,690 @@
 
 import React, { useEffect, useMemo, useState } from 'react';
 import { ethers } from 'ethers';
+import { sdk } from '@farcaster/frame-sdk';
 
-const BASE_CHAIN_ID_DEC = 8453;
-const BASE_CHAIN_ID_HEX = '0x2105';
+// === SETTINGS ===
+const MIN_K = 60;
+const MAX_K = 120;
+const MAX_ATTEMPTS = 7;
 
-// Mainnet public RPC for ENS reverse lookup (.base.eth often resolves here)
-const MAINNET_RPC = 'https://cloudflare-eth.com';
+// === BASE MAINNET ===
+const BASE_MAINNET = {
+  chainIdDec: 8453,
+  chainIdHex: '0x2105',
+  chainName: 'Base Mainnet',
+  nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 },
+  rpcUrls: ['https://mainnet.base.org'],
+  blockExplorerUrls: ['https://basescan.org'],
+};
+
+const ACTIVE = BASE_MAINNET;
+
+// ENS registry canonical address (часто используется на L2; если на Base другой — просто вернёт null)
+const ENS_REGISTRY = '0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e';
+
+// Адрес контракта: берём из .env, иначе fallback на твой
+const CONTRACT_ADDRESS =
+  process.env.NEXT_PUBLIC_CONTRACT_ADDRESS || '0x622678862992c0A2414b536Bc4B8B391602BCf';
+
+const CONTRACT_ABI = [
+  'function played(uint256 score, uint256 guess) external',
+  'event Played(address indexed user, uint256 score, uint256 guess, uint256 ts)',
+];
+
+function randomInt(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+function formatError(e) {
+  try {
+    const parts = [];
+    if (e?.shortMessage) parts.push(`short=${e.shortMessage}`);
+    if (e?.message) parts.push(`msg=${e.message}`);
+    if (e?.code) parts.push(`code=${e.code}`);
+    if (e?.reason) parts.push(`reason=${e.reason}`);
+    if (e?.data) {
+      const d = typeof e.data === 'string' ? e.data : JSON.stringify(e.data);
+      parts.push(`data=${d}`);
+    }
+    return parts.length ? parts.join(' | ') : String(e);
+  } catch {
+    return String(e?.message || e);
+  }
+}
 
 function shortAddr(a) {
-  if (!a) return '';
-  return `${a.slice(0, 6)}…${a.slice(-4)}`;
+  return a ? `${a.slice(0, 6)}…${a.slice(-4)}` : '-';
 }
 
-function parseChainIdToDec(chainId) {
-  // chainId may be: "0x2105" (string hex) or 8453 (number)
-  if (chainId == null) return null;
-  if (typeof chainId === 'number') return chainId;
-  if (typeof chainId === 'string') {
-    if (chainId.startsWith('0x')) return parseInt(chainId, 16);
-    const n = Number(chainId);
-    return Number.isFinite(n) ? n : null;
+// Мини-blockies без зависимостей
+function addrToAvatar(address, size = 6, scale = 8) {
+  if (!address) return null;
+
+  let seed = 0;
+  for (let i = 0; i < address.length; i++) seed = (seed * 31 + address.charCodeAt(i)) >>> 0;
+  const rand = () => ((seed = (seed * 1103515245 + 12345) >>> 0) / 2 ** 32);
+
+  const canvas = document.createElement('canvas');
+  const N = size * scale;
+  canvas.width = N;
+  canvas.height = N;
+  const ctx = canvas.getContext('2d');
+
+  ctx.fillStyle = '#eef3f9';
+  ctx.fillRect(0, 0, N, N);
+
+  const baseHue = Math.floor(rand() * 360);
+  const fg = `hsl(${baseHue},70%,45%)`;
+  const bg = `hsl(${(baseHue + 180) % 360},60%,92%)`;
+
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, N, N);
+  ctx.fillStyle = fg;
+
+  const cells = 5;
+  for (let y = 0; y < cells; y++) {
+    for (let x = 0; x < Math.ceil(cells / 2); x++) {
+      const on = rand() > 0.5;
+      if (on) {
+        ctx.fillRect(x * scale, y * scale, scale, scale);
+        ctx.fillRect((cells - 1 - x) * scale, y * scale, scale, scale);
+      }
+    }
   }
-  return null;
+  return canvas.toDataURL('image/png');
 }
 
-async function safeLookupBaseNameViaMainnet(address) {
+// --- BaseName reverse lookup (если reverse record выставлен) ---
+async function lookupReverseNameOnBase(address) {
   try {
-    const p = new ethers.JsonRpcProvider(MAINNET_RPC);
-    // ethers v6: lookupAddress uses ENS reverse record on mainnet
-    const name = await p.lookupAddress(address);
-    return name || null;
-  } catch (e) {
+    const rpc = ACTIVE.rpcUrls[0];
+    const provider = new ethers.JsonRpcProvider(rpc);
+
+    const a = (address || '').toLowerCase();
+    if (!a.startsWith('0x') || a.length !== 42) return null;
+
+    const node = ethers.namehash(`${a.slice(2)}.addr.reverse`);
+
+    const registry = new ethers.Contract(
+      ENS_REGISTRY,
+      ['function resolver(bytes32 node) view returns (address)'],
+      provider
+    );
+
+    const resolverAddr = await registry.resolver(node);
+    if (!resolverAddr || resolverAddr === ethers.ZeroAddress) return null;
+
+    const resolver = new ethers.Contract(
+      resolverAddr,
+      ['function name(bytes32 node) view returns (string)'],
+      provider
+    );
+
+    const name = await resolver.name(node);
+    return name && typeof name === 'string' && name.length ? name : null;
+  } catch {
     return null;
   }
 }
 
 export default function Page() {
-  const [mounted, setMounted] = useState(false);
-
-  const [ethDetected, setEthDetected] = useState(false);
+  // wallet
+  const [hasProvider, setHasProvider] = useState(false);
+  const [isConnected, setIsConnected] = useState(false);
+  const [addr, setAddr] = useState('');
+  const [chainId, setChainId] = useState(null);
   const [status, setStatus] = useState('Не подключено');
 
-  const [address, setAddress] = useState('');
-  const [chainIdRaw, setChainIdRaw] = useState(null);
-  const chainIdDec = useMemo(() => parseChainIdToDec(chainIdRaw), [chainIdRaw]);
-  const chainIdHex = useMemo(() => {
-    if (typeof chainIdRaw === 'string' && chainIdRaw.startsWith('0x')) return chainIdRaw;
-    if (typeof chainIdDec === 'number') return '0x' + chainIdDec.toString(16);
+  // profile
+  const [profileName, setProfileName] = useState('-');
+  const [profileAvatar, setProfileAvatar] = useState(null);
+  const [baseNameInfo, setBaseNameInfo] = useState(''); // текст диагностики
+
+  // game
+  const [targetK, setTargetK] = useState(() => randomInt(MIN_K, MAX_K));
+  const [inputRaw, setInputRaw] = useState('');
+  const [hint, setHint] = useState('');
+  const [attemptsThisRound, setAttemptsThisRound] = useState(0);
+  const [rounds, setRounds] = useState(0);
+  const [wins, setWins] = useState(0);
+
+  // score
+  const [totalScore, setTotalScore] = useState(0);
+  const [lastRoundScore, setLastRoundScore] = useState(0);
+  const [bestRoundScore, setBestRoundScore] = useState(0);
+
+  // last win persists
+  const [lastWin, setLastWin] = useState(null); // { score, guessK, ts }
+  const [lastSavedTx, setLastSavedTx] = useState('');
+
+  // onchain ui
+  const [isSaving, setIsSaving] = useState(false);
+  const [txHash, setTxHash] = useState('');
+  const [txMsg, setTxMsg] = useState('');
+  const [err, setErr] = useState('');
+
+  const isCorrectChain = chainId === ACTIVE.chainIdDec;
+
+  const interpretedK = useMemo(() => {
+    const t = (inputRaw || '').trim();
+    if (t === '') return null;
+    if (!/^\d+$/.test(t)) return null;
+    if (t.length > 3) return null;
+    const n = Number(t);
+    if (!Number.isFinite(n)) return null;
+    return n;
+  }, [inputRaw]);
+
+  const interpretedLabel = useMemo(() => {
+    if (interpretedK === null) return '';
+    return `${interpretedK}k`;
+  }, [interpretedK]);
+
+  const interpretedUsd = useMemo(() => {
+    if (interpretedK === null) return null;
+    return interpretedK * 1000;
+  }, [interpretedK]);
+
+  function resetRound() {
+    setTargetK(randomInt(MIN_K, MAX_K));
+    setAttemptsThisRound(0);
+    setInputRaw('');
+    setHint('');
+    setLastRoundScore(0);
+    setErr('');
+    setTxMsg('');
+    setTxHash('');
+  }
+
+  function onInputChange(e) {
+    const v = String(e.target.value || '').replace(/[^\d]/g, '').slice(0, 3);
+    setInputRaw(v);
+  }
+
+  function validateRangeK(k) {
+    if (k === null) return 'Введите число.';
+    if (!Number.isInteger(k)) return 'Только целые числа.';
+    if (k < MIN_K || k > MAX_K) return `Только от ${MIN_K} до ${MAX_K}.`;
     return '';
-  }, [chainIdRaw, chainIdDec]);
-
-  const [baseName, setBaseName] = useState('');
-  const [baseNameNote, setBaseNameNote] = useState('');
-
-  const isOnBase = chainIdDec === BASE_CHAIN_ID_DEC;
-
-  // UI state for buttons
-  const [connectBusy, setConnectBusy] = useState(false);
-  const [nameBusy, setNameBusy] = useState(false);
-
-  useEffect(() => {
-    setMounted(true);
-    setEthDetected(Boolean(globalThis?.window?.ethereum));
-  }, []);
-
-  async function refreshFromWallet(silent = true) {
-    try {
-      const { ethereum } = window;
-      if (!ethereum) {
-        setEthDetected(false);
-        setStatus('Нет web3 провайдера (window.ethereum)');
-        return;
-      }
-      setEthDetected(true);
-
-      const provider = new ethers.BrowserProvider(ethereum);
-      const net = await provider.getNetwork();
-      // net.chainId in ethers v6 is bigint
-      const dec = Number(net.chainId);
-      setChainIdRaw(dec);
-
-      const accounts = await provider.send('eth_accounts', []);
-      if (accounts && accounts[0]) {
-        setAddress(ethers.getAddress(accounts[0]));
-        setStatus(silent ? 'Подключено' : 'Подключено');
-      } else {
-        setAddress('');
-        setStatus('Не подключено');
-      }
-    } catch (e) {
-      setStatus(`Ошибка refresh: ${String(e?.message || e)}`);
-    }
   }
 
-  async function connect() {
+  async function refreshBaseName(address) {
     try {
-      setConnectBusy(true);
-      setBaseName('');
-      setBaseNameNote('');
-
-      const { ethereum } = window;
-      if (!ethereum) {
-        setEthDetected(false);
-        setStatus('Нет web3 провайдера (window.ethereum)');
-        return;
-      }
-
-      const provider = new ethers.BrowserProvider(ethereum);
-
-      // IMPORTANT: request accounts on button click
-      const accounts = await provider.send('eth_requestAccounts', []);
-      if (!accounts || !accounts[0]) {
-        setStatus('Подключение отменено');
-        return;
-      }
-
-      const addr = ethers.getAddress(accounts[0]);
-      setAddress(addr);
-
-      const net = await provider.getNetwork();
-      const dec = Number(net.chainId);
-      setChainIdRaw(dec);
-
-      setStatus('Подключено');
-
-      // after connect -> try resolve name
-      await resolveBaseName(addr);
-
-    } catch (e) {
-      setStatus(`Connect error: ${String(e?.message || e)}`);
-    } finally {
-      setConnectBusy(false);
-    }
-  }
-
-  async function resolveBaseName(addr = address) {
-    if (!addr) return;
-    try {
-      setNameBusy(true);
-      setBaseName('');
-      setBaseNameNote('Ищу Base Name…');
-
-      // 1) mainnet ENS reverse (most reliable for .base.eth)
-      const name = await safeLookupBaseNameViaMainnet(addr);
-
+      setBaseNameInfo('Ищу Base Name…');
+      const name = await lookupReverseNameOnBase(address);
       if (name) {
-        setBaseName(name);
-        setBaseNameNote('Ок (ENS reverse на Ethereum mainnet)');
+        setProfileName(name);
+        setBaseNameInfo('');
         return;
       }
+      setProfileName(shortAddr(address));
+      setBaseNameInfo('Base Name: не найден (скорее всего не выставлен reverse/primary record).');
+    } catch {
+      setProfileName(shortAddr(address));
+      setBaseNameInfo('Base Name: не найден.');
+    }
+  }
 
-      // If null -> give actionable note
-      setBaseName('');
-      setBaseNameNote('не найден (lookup вернул null)');
-    } finally {
-      setNameBusy(false);
+  // ===== Wallet helpers =====
+  async function refreshWalletState() {
+    try {
+      const eth = window.ethereum;
+      if (!eth) return;
+
+      const accounts = await eth.request({ method: 'eth_accounts' });
+      const connected = Array.isArray(accounts) && accounts.length > 0;
+      setIsConnected(connected);
+
+      if (connected) {
+        const a = accounts[0];
+        setAddr(a);
+        setStatus('Подключено');
+
+        // avatar
+        try {
+          setProfileAvatar(addrToAvatar(a));
+        } catch {
+          setProfileAvatar(null);
+        }
+
+        // name (reverse)
+        await refreshBaseName(a);
+      } else {
+        setAddr('');
+        setStatus('Не подключено');
+        setProfileName('-');
+        setProfileAvatar(null);
+        setBaseNameInfo('');
+      }
+
+      const cidHex = await eth.request({ method: 'eth_chainId' });
+      setChainId(parseInt(cidHex, 16));
+    } catch (e) {
+      setErr(formatError(e));
+    }
+  }
+
+  async function connectWallet() {
+    setErr('');
+    try {
+      const eth = window.ethereum;
+      if (!eth) {
+        setErr('Нет кошелька (window.ethereum). Открой в Base App / Coinbase Wallet / MetaMask.');
+        return;
+      }
+      await eth.request({ method: 'eth_requestAccounts' });
+      await refreshWalletState();
+    } catch (e) {
+      setErr(formatError(e));
+    }
+  }
+
+  async function switchToMainnet() {
+    setErr('');
+    try {
+      const eth = window.ethereum;
+      if (!eth) return;
+
+      try {
+        await eth.request({
+          method: 'wallet_switchEthereumChain',
+          params: [{ chainId: ACTIVE.chainIdHex }],
+        });
+      } catch (switchErr) {
+        if (switchErr?.code === 4902) {
+          await eth.request({
+            method: 'wallet_addEthereumChain',
+            params: [
+              {
+                chainId: ACTIVE.chainIdHex,
+                chainName: ACTIVE.chainName,
+                nativeCurrency: ACTIVE.nativeCurrency,
+                rpcUrls: ACTIVE.rpcUrls,
+                blockExplorerUrls: ACTIVE.blockExplorerUrls,
+              },
+            ],
+          });
+        } else {
+          throw switchErr;
+        }
+      }
+
+      await refreshWalletState();
+    } catch (e) {
+      setErr(formatError(e));
     }
   }
 
   useEffect(() => {
-    if (!mounted) return;
+    const eth = window.ethereum;
+    setHasProvider(!!eth);
+    if (!eth) return;
 
-    // initial read
-    refreshFromWallet(true);
+    const onAccountsChanged = () => refreshWalletState();
+    const onChainChanged = () => refreshWalletState();
 
-    const { ethereum } = window;
-    if (!ethereum) return;
+    eth.on?.('accountsChanged', onAccountsChanged);
+    eth.on?.('chainChanged', onChainChanged);
 
-    const onAccountsChanged = (accs) => {
-      const a = accs && accs[0] ? ethers.getAddress(accs[0]) : '';
-      setAddress(a);
-      setBaseName('');
-      setBaseNameNote('');
-      if (a) {
-        setStatus('Подключено');
-        resolveBaseName(a);
-      } else {
-        setStatus('Не подключено');
-      }
-    };
+    refreshWalletState();
 
-    const onChainChanged = (cid) => {
-      // cid usually "0x2105"
-      setChainIdRaw(cid);
-      // re-sync everything
-      refreshFromWallet(true);
-    };
-
-    ethereum.on?.('accountsChanged', onAccountsChanged);
-    ethereum.on?.('chainChanged', onChainChanged);
+    try {
+      sdk.actions.ready();
+    } catch {}
 
     return () => {
-      ethereum.removeListener?.('accountsChanged', onAccountsChanged);
-      ethereum.removeListener?.('chainChanged', onChainChanged);
+      eth.removeListener?.('accountsChanged', onAccountsChanged);
+      eth.removeListener?.('chainChanged', onChainChanged);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mounted]);
+  }, []);
 
-  const needBaseText = isOnBase
-    ? ''
-    : `ChainId: ${chainIdHex || String(chainIdRaw || '')} (нужен ${BASE_CHAIN_ID_DEC})`;
+  // ===== Game logic =====
+  function guessNow() {
+    setErr('');
+    setTxMsg('');
+    setTxHash('');
+
+    const k = interpretedK;
+    const rangeErr = validateRangeK(k);
+    if (rangeErr) {
+      setErr(rangeErr);
+      return;
+    }
+
+    const nextAttempts = attemptsThisRound + 1;
+    setAttemptsThisRound(nextAttempts);
+
+    if (k === targetK) {
+      const roundScore = Math.max(0, MAX_ATTEMPTS - nextAttempts + 1);
+
+      setLastRoundScore(roundScore);
+      setTotalScore((s) => s + roundScore);
+      setBestRoundScore((b) => Math.max(b, roundScore));
+
+      setHint('✅ Правильно!');
+      setWins((w) => w + 1);
+      setRounds((r) => r + 1);
+
+      const win = { score: roundScore, guessK: k, ts: Date.now() };
+      setLastWin(win);
+      setLastSavedTx('');
+
+      setTimeout(() => {
+        setTargetK(randomInt(MIN_K, MAX_K));
+        setAttemptsThisRound(0);
+        setInputRaw('');
+        setHint('');
+      }, 600);
+
+      return;
+    }
+
+    if (k < targetK) setHint('⬆️ Выше');
+    else setHint('⬇️ Ниже');
+
+    if (nextAttempts >= MAX_ATTEMPTS) {
+      setRounds((r) => r + 1);
+      setHint(`❌ Раунд проигран. Было: ${targetK}k`);
+      setLastRoundScore(0);
+
+      setTimeout(() => {
+        setTargetK(randomInt(MIN_K, MAX_K));
+        setAttemptsThisRound(0);
+        setInputRaw('');
+        setHint('');
+      }, 700);
+    }
+  }
+
+  // ===== HARD DIAG: check contract реально ли контракт и можно ли вызвать played =====
+  async function diagnose(provider) {
+    const net = await provider.getNetwork();
+    const currentChainId = Number(net.chainId);
+
+    const code = await provider.getCode(CONTRACT_ADDRESS);
+    const isContract = code && code !== '0x';
+
+    return { currentChainId, isContract, codeLen: code === '0x' ? 0 : code.length };
+  }
+
+  // ===== Onchain save =====
+  async function saveOnchain() {
+    setErr('');
+    setTxMsg('');
+    setTxHash('');
+
+    try {
+      const eth = window.ethereum;
+      if (!eth) return setErr('Нет provider (window.ethereum). Открой в кошельке (Base App/Coinbase/MetaMask).');
+
+      const accounts = await eth.request({ method: 'eth_accounts' });
+      if (!Array.isArray(accounts) || accounts.length === 0) {
+        await eth.request({ method: 'eth_requestAccounts' });
+      }
+      await refreshWalletState();
+
+      if (!lastWin) return setErr('Нет победы для сохранения. Сначала выиграй раунд.');
+
+      setIsSaving(true);
+
+      const provider = new ethers.BrowserProvider(eth);
+
+      setTxMsg('Диагностика сети/контракта...');
+      const d = await diagnose(provider);
+
+      if (d.currentChainId !== ACTIVE.chainIdDec) {
+        setIsSaving(false);
+        return setErr(
+          `Не та сеть. Сейчас chainId=${d.currentChainId}. Нужна ${ACTIVE.chainName} (${ACTIVE.chainIdDec}). Нажми "Switch to Base Mainnet".`
+        );
+      }
+
+      if (!d.isContract) {
+        setIsSaving(false);
+        return setErr(`По адресу ${CONTRACT_ADDRESS} НЕТ контракта (getCode=0x). Проверь адрес/деплой в Base Mainnet.`);
+      }
+
+      const signer = await provider.getSigner();
+      const signerAddr = await signer.getAddress();
+      if (!signerAddr) {
+        setIsSaving(false);
+        return setErr('Signer не получен (кошелёк не дал адрес).');
+      }
+
+      const contract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, signer);
+
+      setTxMsg('Пробую estimateGas...');
+      let gasLimit = 200000n;
+      try {
+        const est = await contract.played.estimateGas(BigInt(lastWin.score), BigInt(lastWin.guessK));
+        gasLimit = est + est / 4n;
+      } catch {}
+
+      setTxMsg('Открываю кошелёк для подтверждения...');
+      const tx = await contract.played(BigInt(lastWin.score), BigInt(lastWin.guessK), { gasLimit });
+
+      setTxMsg('Ожидаю подтверждение...');
+      const receipt = await tx.wait();
+
+      const hash = receipt?.hash || tx?.hash || '';
+      setTxHash(hash);
+      setTxMsg('✅ Записано onchain!');
+      setLastSavedTx(hash);
+    } catch (e) {
+      setErr(formatError(e));
+    } finally {
+      setIsSaving(false);
+    }
+  }
 
   return (
-    <div style={{ minHeight: '100vh', padding: 16, fontFamily: 'system-ui, -apple-system, Segoe UI, Roboto, Arial' }}>
-      <h2 style={{ margin: 0, marginBottom: 8 }}>Mini App: BTC Guess (Base Mainnet)</h2>
-      <div style={{ opacity: 0.8, marginBottom: 12 }}>
-        Допустимые уровни: <b>60k … 120k</b><br />
-        Вводи число <b>60…120</b> (например: 69 = 69k = $69,000). Попыток на раунд: <b>7</b>
-      </div>
-
-      <div style={{
-        border: '1px solid #e5e7eb',
-        borderRadius: 14,
-        padding: 12,
-        marginBottom: 12,
+    <div
+      style={{
+        minHeight: '100vh',
+        backgroundImage: "url('/bg.jpg')",
+        backgroundRepeat: 'no-repeat',
+        backgroundPosition: 'top center',
+        backgroundSize: 'contain',
+        backgroundColor: '#061a33',
+        padding: 16,
         display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'space-between',
-        gap: 12
-      }}>
-        <div>
-          <div style={{ fontSize: 18, fontWeight: 700 }}>{address ? shortAddr(address) : '—'}</div>
-          <div style={{ opacity: 0.85 }}>Статус: {status}</div>
-          <div style={{ opacity: 0.85 }}>
-            {needBaseText ? (
-              <span style={{ color: '#b45309' }}>{needBaseText}</span>
+        justifyContent: 'center',
+      }}
+    >
+      <main
+        style={{
+          fontFamily: 'Arial, sans-serif',
+          width: '100%',
+          maxWidth: 980,
+          background: 'rgba(255,255,255,0.92)',
+          borderRadius: 16,
+          padding: 16,
+          boxShadow: '0 8px 28px rgba(0,0,0,0.25)',
+        }}
+      >
+        <h2 style={{ marginBottom: 6 }}>Mini App: BTC Guess ({ACTIVE.chainName})</h2>
+
+        <div style={{ marginBottom: 10, color: '#444' }}>
+          Вводи число <b>{MIN_K}…{MAX_K}</b> (пример: <b>69</b> = <b>69k</b> = <b>$69,000</b>). Попыток на раунд:{' '}
+          <b>{MAX_ATTEMPTS}</b>
+        </div>
+
+        {/* PROFILE CARD */}
+        <div
+          style={{
+            marginBottom: 12,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 12,
+            padding: 10,
+            border: '1px solid #e5e7eb',
+            borderRadius: 12,
+            background: '#fafbff',
+          }}
+        >
+          <div
+            style={{
+              width: 44,
+              height: 44,
+              borderRadius: '50%',
+              overflow: 'hidden',
+              border: '1px solid #e5e7eb',
+              background: '#fff',
+              flex: '0 0 44px',
+            }}
+          >
+            {profileAvatar ? (
+              <img src={profileAvatar} alt="avatar" style={{ width: '100%', height: '100%' }} />
             ) : (
-              <span>ChainId: {chainIdHex || '—'} ({chainIdDec ?? '—'})</span>
+              <div style={{ width: '100%', height: '100%', background: '#eef3f9' }} />
             )}
+          </div>
+
+          <div style={{ lineHeight: 1.25, width: '100%' }}>
+            <div style={{ fontWeight: 700 }}>{profileName}</div>
+            <div style={{ fontSize: 12, color: '#666' }}>
+              {status}
+              {isConnected && !isCorrectChain ? ' · не та сеть' : ''}
+            </div>
+            <div style={{ fontSize: 12, color: '#8b8b8b', wordBreak: 'break-all' }}>{addr ? addr : '-'}</div>
+            {baseNameInfo ? <div style={{ fontSize: 12, color: '#8b0000', marginTop: 6 }}>{baseNameInfo}</div> : null}
           </div>
         </div>
 
-        <button
-          onClick={connect}
-          disabled={connectBusy}
-          style={{
-            padding: '10px 16px',
-            borderRadius: 12,
-            border: '1px solid #2563eb',
-            background: connectBusy ? '#93c5fd' : '#2563eb',
-            color: 'white',
-            fontWeight: 700,
-            cursor: connectBusy ? 'not-allowed' : 'pointer',
-            minWidth: 110
-          }}
-        >
-          {connectBusy ? '...' : 'Connect'}
-        </button>
-      </div>
-
-      <div style={{ marginBottom: 10 }}>
-        <div style={{ opacity: 0.85 }}>
-          Адрес: <b>{address || '—'}</b>
-        </div>
-        <div style={{ opacity: 0.85 }}>
-          Base Name:{' '}
-          <b>{baseName ? baseName : 'не найден'}</b>{' '}
-          <span style={{ opacity: 0.8 }}>
-            {baseNameNote ? `(${baseNameNote})` : ''}
-          </span>
+        {/* TECH INFO */}
+        <div style={{ marginBottom: 10 }}>
+          <div>
+            <b>ChainId:</b> {chainId ?? '-'}
+          </div>
+          <div style={{ wordBreak: 'break-all' }}>
+            <b>Контракт:</b> {CONTRACT_ADDRESS}
+          </div>
         </div>
 
-        <div style={{ marginTop: 8, display: 'flex', gap: 8 }}>
+        <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 14 }}>
+          {!isConnected && (
+            <button style={{ padding: '10px 14px' }} onClick={connectWallet} disabled={!hasProvider}>
+              Подключить кошелёк
+            </button>
+          )}
+
+          {isConnected && !isCorrectChain && (
+            <button style={{ padding: '10px 14px' }} onClick={switchToMainnet}>
+              Switch to Base Mainnet
+            </button>
+          )}
+
+          {isConnected && (
+            <button style={{ padding: '10px 14px' }} onClick={() => refreshBaseName(addr)}>
+              Обновить Base Name
+            </button>
+          )}
+
+          <button style={{ padding: '10px 14px' }} onClick={resetRound}>
+            Новый раунд
+          </button>
+
           <button
-            onClick={() => resolveBaseName(address)}
-            disabled={!address || nameBusy}
-            style={{
-              padding: '10px 14px',
-              borderRadius: 12,
-              border: '1px solid #e5e7eb',
-              background: (!address || nameBusy) ? '#f3f4f6' : 'white',
-              cursor: (!address || nameBusy) ? 'not-allowed' : 'pointer',
-              fontWeight: 700
-            }}
+            style={{ padding: '10px 14px' }}
+            onClick={saveOnchain}
+            disabled={!hasProvider || !lastWin || isSaving}
+            title={!lastWin ? 'Сначала выиграй раунд' : 'Записать победу onchain'}
           >
-            {nameBusy ? 'Ищу…' : 'Обновить Base Name'}
+            {isSaving ? 'Сохраняю…' : 'Сохранить результат (onchain)'}
           </button>
         </div>
 
-        <div style={{ marginTop: 10, fontSize: 13, opacity: 0.75, lineHeight: 1.35 }}>
-          Если Base Name “не найден”, это почти всегда значит, что для этого адреса не выставлена обратная запись (reverse).
-          В Base Names у тебя имя видно — ок. Но reverse может быть не выставлен/не обновился.
-        </div>
-      </div>
+        <div style={{ marginBottom: 10 }}>
+          <div style={{ marginBottom: 6 }}>
+            <b>Угадай уровень BTC (k):</b> введи <b>{MIN_K}…{MAX_K}</b>
+          </div>
 
-      <div style={{ display: 'grid', gap: 10 }}>
-        <button
-          style={{ padding: 14, borderRadius: 14, border: '1px solid #e5e7eb', background: 'white', fontWeight: 800 }}
-          onClick={() => alert('Новый раунд (пока заглушка UI)')}
-        >
-          Новый раунд
-        </button>
+          <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+            <input
+              value={inputRaw}
+              onChange={onInputChange}
+              inputMode="numeric"
+              placeholder="например 69"
+              style={{ width: 180, padding: '10px 12px', fontSize: 16 }}
+              maxLength={3}
+            />
 
-        <button
-          style={{ padding: 14, borderRadius: 14, border: '1px solid #e5e7eb', background: '#f3f4f6', fontWeight: 800, opacity: 0.65 }}
-          disabled
-        >
-          Сохранить результат (onchain)
-        </button>
+            <button style={{ padding: '10px 14px' }} onClick={guessNow}>
+              Проверить
+            </button>
 
-        <button
-          style={{ padding: 14, borderRadius: 14, border: '1px solid #e5e7eb', background: 'white', fontWeight: 800 }}
-          onClick={() => alert('Лидерборд (пока заглушка UI)')}
-        >
-          Обновить лидерборд
-        </button>
-      </div>
+            <div style={{ color: '#333' }}>
+              {interpretedK !== null ? (
+                <span>
+                  Интерпретируется как <b>{interpretedLabel}</b> (<b>${interpretedUsd?.toLocaleString('en-US')}</b>)
+                </span>
+              ) : (
+                <span style={{ color: '#777' }}>Введите число (2–3 цифры)</span>
+              )}
+            </div>
+          </div>
+        </div>
 
-      <div style={{ marginTop: 14, borderTop: '1px solid #eee', paddingTop: 14 }}>
-        <div style={{ fontSize: 18, fontWeight: 900 }}>Угадай уровень BTC (k): введи 60…120</div>
-        <div style={{ display: 'flex', gap: 10, marginTop: 10 }}>
-          <input
-            placeholder="например 69"
-            style={{ flex: 1, padding: 12, borderRadius: 12, border: '1px solid #e5e7eb', fontSize: 16 }}
-          />
-          <button
-            style={{ padding: '12px 16px', borderRadius: 12, border: '1px solid #e5e7eb', fontWeight: 800 }}
-            onClick={() => alert('Проверить (заглушка UI)')}
-          >
-            Проверить
-          </button>
+        <div style={{ marginBottom: 12 }}>
+          <b>Подсказка:</b> <span style={{ marginLeft: 8 }}>{hint || '-'}</span>
         </div>
-        <div style={{ marginTop: 10, opacity: 0.8 }}>
-          Подсказка: -
+
+        <div style={{ marginBottom: 12 }}>
+          <div>
+            Попыток (в этом раунде): <b>{attemptsThisRound}</b> / {MAX_ATTEMPTS}
+          </div>
+          <div>
+            Раунды: <b>{rounds}</b>
+          </div>
+          <div>
+            Победы: <b>{wins}</b>
+          </div>
+          <div>
+            Очки за последнюю победу: <b>{lastRoundScore}</b>
+          </div>
+          <div>
+            Лучший результат за раунд: <b>{bestRoundScore}</b>
+          </div>
+          <div>
+            Суммарные очки (total): <b>{totalScore}</b>
+          </div>
         </div>
-        <div style={{ marginTop: 6, opacity: 0.8 }}>
-          Попыток (в этом раунде): 0 / 7<br />
-          Раунды: 0<br />
-          Победы: 0<br />
-          Очки за последнюю победу: 0
+
+        <div style={{ padding: 12, border: '1px solid #ddd', borderRadius: 10, marginBottom: 14 }}>
+          <div style={{ marginBottom: 6 }}>
+            <b>Последняя победа (для onchain):</b>
+          </div>
+          {lastWin ? (
+            <div>
+              <div>
+                guess: <b>{lastWin.guessK}k</b>
+              </div>
+              <div>
+                score: <b>{lastWin.score}</b>
+              </div>
+              <div style={{ wordBreak: 'break-all' }}>
+                saved tx: <b>{lastSavedTx ? lastSavedTx : '-'}</b>
+              </div>
+            </div>
+          ) : (
+            <div style={{ color: '#666' }}>Пока нет победы.</div>
+          )}
         </div>
-      </div>
+
+        {txMsg ? <div style={{ marginBottom: 8, color: '#0a4' }}>{txMsg}</div> : null}
+        {txHash ? (
+          <div style={{ marginBottom: 8, wordBreak: 'break-all' }}>
+            tx: <b>{txHash}</b>
+          </div>
+        ) : null}
+        {err ? (
+          <div style={{ marginTop: 10, color: '#b00000', whiteSpace: 'pre-wrap' }}>
+            <b>Ошибка:</b> {err}
+          </div>
+        ) : null}
+      </main>
     </div>
   );
 }
