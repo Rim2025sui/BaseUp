@@ -2,564 +2,771 @@
 
 import React, { useEffect, useMemo, useState } from 'react';
 import { ethers } from 'ethers';
+import { sdk } from '@farcaster/frame-sdk';
 
-// ===== CONFIG =====
-const CHAIN_ID = 8453;
-const CHAIN_HEX = '0x2105';
-
-const RPC_URLS = [
-  'https://mainnet.base.org',
-  'https://base.llamarpc.com',
-  'https://1rpc.io/base',
-  'https://rpc.ankr.com/base',
-];
-
-const CONTRACT_ADDRESS = '0x622678862992c0A2414b536Bc4B8B391602BCf';
-
-// Basenames L2 Resolver
-const BASENAME_L2_RESOLVER_ADDRESS = '0xC6d566A56A1aFf6508b41f6c90ff131615583BCD';
-
-const LOOKBACK_BLOCKS = 80_000;
+// === SETTINGS ===
+const MIN_K = 60;
+const MAX_K = 120;
 const MAX_ATTEMPTS = 7;
-const GAS_HEX = '0x249F0'; // 150000
 
-// ===== ABI =====
-const L2_RESOLVER_ABI = [
-  'function name(bytes32 node) view returns (string)',
-  'function text(bytes32 node, string key) view returns (string)',
+// === FIXED BASE MAINNET ===
+const BASE_MAINNET = {
+  chainIdDec: 8453,
+  chainIdHex: '0x2105',
+  chainName: 'Base Mainnet',
+  nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 },
+  rpcUrls: ['https://mainnet.base.org'],
+  blockExplorerUrls: ['https://basescan.org'],
+};
+
+const ACTIVE = BASE_MAINNET;
+
+// ✅ адрес берём из .env.local (а не хардкод)
+const CONTRACT_ADDRESS =
+  process.env.NEXT_PUBLIC_CONTRACT_ADDRESS || '0x085439394e6FEac14FFB61134ba8F81fA8A9f314';
+
+const CONTRACT_ABI = [
+  'function played(uint256 score, uint256 guess) external',
+  'event Played(address indexed user, uint256 score, uint256 guess, uint256 ts)',
 ];
 
-const GAME_WRITE_ABI = [
-  'function play(uint256 score, uint256 guess)',
-  'function save(uint256 score, uint256 guess)',
-  'function record(uint256 score, uint256 guess)',
-  'function submit(uint256 score, uint256 guess)',
-];
+function randomInt(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
 
-const EVENT_SIGS = [
-  'Played(address,uint256,uint256,uint256)',
-  'GamePlayed(address,uint256,uint256,uint256)',
-];
+function formatError(e) {
+  try {
+    const parts = [];
+    if (e?.shortMessage) parts.push(`short=${e.shortMessage}`);
+    if (e?.message) parts.push(`msg=${e.message}`);
+    if (e?.code) parts.push(`code=${e.code}`);
+    if (e?.reason) parts.push(`reason=${e.reason}`);
+    if (e?.data) {
+      const d = typeof e.data === 'string' ? e.data : JSON.stringify(e.data);
+      parts.push(`data=${d}`);
+    }
+    return parts.length ? parts.join(' | ') : String(e);
+  } catch {
+    return String(e?.message || e);
+  }
+}
 
-// ===== utils =====
+// --- PROFILE HELPERS ---
 function shortAddr(a) {
-  if (!a) return '';
-  return a.slice(0, 6) + '…' + a.slice(-4);
+  return a ? `${a.slice(0, 6)}…${a.slice(-4)}` : '-';
 }
 
-function ipfsToHttp(url) {
-  if (!url) return '';
-  if (url.startsWith('ipfs://')) return `https://ipfs.io/ipfs/${url.slice('ipfs://'.length)}`;
-  return url;
+// Лёгкий blockies-аватар без зависимостей (canvas→dataURL)
+function addrToAvatar(address, size = 6, scale = 8) {
+  if (!address || typeof document === 'undefined') return null;
+
+  let seed = 0;
+  for (let i = 0; i < address.length; i++) seed = (seed * 31 + address.charCodeAt(i)) >>> 0;
+  const rand = () => ((seed = (seed * 1103515245 + 12345) >>> 0) / 2 ** 32);
+
+  const canvas = document.createElement('canvas');
+  const N = size * scale;
+  canvas.width = N;
+  canvas.height = N;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+
+  const baseHue = Math.floor(rand() * 360);
+  const fg = `hsl(${baseHue},70%,45%)`;
+  const bg = `hsl(${(baseHue + 180) % 360},60%,92%)`;
+
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, N, N);
+
+  ctx.fillStyle = fg;
+  const cells = 5;
+
+  for (let y = 0; y < cells; y++) {
+    for (let x = 0; x < Math.ceil(cells / 2); x++) {
+      const on = rand() > 0.5;
+      if (on) {
+        ctx.fillRect(x * scale, y * scale, scale, scale);
+        ctx.fillRect((cells - 1 - x) * scale, y * scale, scale, scale);
+      }
+    }
+  }
+
+  return canvas.toDataURL('image/png');
 }
 
-function calcScore(attemptsUsed) {
-  return Math.max(1, 8 - attemptsUsed);
-}
+async function hydrateProfile(provider, address) {
+  // Возвращаем { displayName, avatarUrl } — НЕ ломаемся, если сеть/провайдер не умеет
+  const fallback = { displayName: shortAddr(address), avatarUrl: addrToAvatar(address) };
 
-function randomSecret() {
-  return 60 + Math.floor(Math.random() * 61);
-}
+  try {
+    if (!provider || !address) return fallback;
 
-function intToHex(n) {
-  return '0x' + Number(n).toString(16);
-}
+    let name = null;
+    try {
+      // На некоторых провайдерах Base reverse может работать, на некоторых нет — поэтому try/catch
+      name = await provider.lookupAddress(address);
+    } catch {
+      name = null;
+    }
 
-async function rpcFetch(url, method, params) {
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
-  });
-  const j = await res.json();
-  if (j?.error) throw new Error(j.error.message || 'RPC error');
-  return j.result;
+    if (!name) return fallback;
+
+    let avatar = null;
+    try {
+      // Если имя поддерживает avatar (ENS-like) — попробуем
+      avatar = await provider.getAvatar(name);
+    } catch {
+      avatar = null;
+    }
+
+    return {
+      displayName: name,
+      avatarUrl: avatar || fallback.avatarUrl,
+    };
+  } catch {
+    return fallback;
+  }
 }
 
 export default function Page() {
-  const [activeRpc, setActiveRpc] = useState(RPC_URLS[0]);
-
-  // read provider (привязан к activeRpc)
-  const readProvider = useMemo(() => new ethers.JsonRpcProvider(activeRpc), [activeRpc]);
-
-  const l2ResolverRead = useMemo(
-    () => new ethers.Contract(BASENAME_L2_RESOLVER_ADDRESS, L2_RESOLVER_ABI, readProvider),
-    [readProvider]
-  );
-
   // wallet
-  const [address, setAddress] = useState('');
-  const [chainId, setChainId] = useState(CHAIN_ID);
+  const [hasProvider, setHasProvider] = useState(false);
+  const [isConnected, setIsConnected] = useState(false);
+  const [addr, setAddr] = useState('');
+  const [chainId, setChainId] = useState(null);
+  const [status, setStatus] = useState('Не подключено');
 
-  // basename
-  const [basename, setBasename] = useState('');
-  const [avatarUrl, setAvatarUrl] = useState('');
-  const [nameStatus, setNameStatus] = useState('');
+  // profile (avatar + display name)
+  const [profileName, setProfileName] = useState('-');
+  const [profileAvatar, setProfileAvatar] = useState(null);
 
   // game
-  const [secret, setSecret] = useState(() => randomSecret());
-  const [guess, setGuess] = useState('');
-  const [hint, setHint] = useState('-');
-  const [attempts, setAttempts] = useState(0);
+  const [targetK, setTargetK] = useState(() => randomInt(MIN_K, MAX_K));
+  const [inputRaw, setInputRaw] = useState('');
+  const [hint, setHint] = useState('');
+  const [attemptsThisRound, setAttemptsThisRound] = useState(0);
+  const [rounds, setRounds] = useState(0);
   const [wins, setWins] = useState(0);
-  const [rounds, setRounds] = useState(1);
 
-  // scoring
-  const [lastWin, setLastWin] = useState(null); // { guessK, score }
-  const [bestScore, setBestScore] = useState(0);
+  // score
   const [totalScore, setTotalScore] = useState(0);
+  const [lastRoundScore, setLastRoundScore] = useState(0);
+  const [bestRoundScore, setBestRoundScore] = useState(0);
 
-  // tx/diag
-  const [diag, setDiag] = useState('');
+  // last win persists
+  const [lastWin, setLastWin] = useState(null); // { score, guessK, ts }
+  const [lastSavedTx, setLastSavedTx] = useState('');
+
+  // onchain ui
+  const [isSaving, setIsSaving] = useState(false);
+  const [txHash, setTxHash] = useState('');
+  const [txMsg, setTxMsg] = useState('');
   const [err, setErr] = useState('');
-  const [savedTx, setSavedTx] = useState('');
 
   // leaderboard
-  const [leaderboard, setLeaderboard] = useState([]);
-  const [lbStatus, setLbStatus] = useState('Нажми “Обновить лидерборд”.');
+  const [lbLoading, setLbLoading] = useState(false);
+  const [lbRows, setLbRows] = useState([]);
+  const [lbInfo, setLbInfo] = useState('');
 
-  // write method cache
-  const [writeMethod, setWriteMethod] = useState('');
+  const isCorrectChain = chainId === ACTIVE.chainIdDec;
 
-  // STATE persist
-  useEffect(() => {
+  const interpretedK = useMemo(() => {
+    if (inputRaw.trim() === '') return null;
+    if (!/^\d+$/.test(inputRaw)) return null;
+    if (inputRaw.length > 3) return null;
+    const n = Number(inputRaw);
+    if (!Number.isFinite(n)) return null;
+    return n;
+  }, [inputRaw]);
+
+  const interpretedLabel = useMemo(() => {
+    if (interpretedK === null) return '';
+    return `${interpretedK}k`;
+  }, [interpretedK]);
+
+  const interpretedUsd = useMemo(() => {
+    if (interpretedK === null) return null;
+    return interpretedK * 1000;
+  }, [interpretedK]);
+
+  function resetRound() {
+    setTargetK(randomInt(MIN_K, MAX_K));
+    setAttemptsThisRound(0);
+    setInputRaw('');
+    setHint('');
+    setLastRoundScore(0);
+    setErr('');
+    setTxMsg('');
+    setTxHash('');
+  }
+
+  function onInputChange(e) {
+    const v = (e.target.value || '').replace(/[^\d]/g, '').slice(0, 3);
+    setInputRaw(v);
+  }
+
+  function validateRangeK(k) {
+    if (k === null) return 'Введите число.';
+    if (!Number.isInteger(k)) return 'Только целые числа.';
+    if (k < MIN_K || k > MAX_K) return `Только от ${MIN_K} до ${MAX_K}.`;
+    return '';
+  }
+
+  // ===== Wallet helpers =====
+  async function refreshWalletState() {
     try {
-      const raw = localStorage.getItem('baseup_state_v3');
-      if (!raw) return;
-      const s = JSON.parse(raw);
-      if (typeof s.secret === 'number') setSecret(s.secret);
-      if (typeof s.attempts === 'number') setAttempts(s.attempts);
-      if (typeof s.wins === 'number') setWins(s.wins);
-      if (typeof s.rounds === 'number') setRounds(s.rounds);
-      if (typeof s.bestScore === 'number') setBestScore(s.bestScore);
-      if (typeof s.totalScore === 'number') setTotalScore(s.totalScore);
-      if (s.lastWin) setLastWin(s.lastWin);
-    } catch {}
-  }, []);
+      const eth = window.ethereum;
+      if (!eth) return;
 
-  useEffect(() => {
-    try {
-      localStorage.setItem(
-        'baseup_state_v3',
-        JSON.stringify({ secret, attempts, wins, rounds, bestScore, totalScore, lastWin })
-      );
-    } catch {}
-  }, [secret, attempts, wins, rounds, bestScore, totalScore, lastWin]);
+      const accounts = await eth.request({ method: 'eth_accounts' });
+      const connected = Array.isArray(accounts) && accounts.length > 0;
+      setIsConnected(connected);
 
-  // wallet listeners
-  useEffect(() => {
-    (async () => {
-      try {
-        if (!window.ethereum) return;
+      if (connected) {
+        const a = accounts[0];
+        setAddr(a);
+        setStatus('Подключено');
 
-        const bp = new ethers.BrowserProvider(window.ethereum);
-        const net = await bp.getNetwork();
-        setChainId(Number(net.chainId));
-
-        const accs = await bp.listAccounts();
-        if (accs?.length) {
-          const a = await bp.getSigner().then((s) => s.getAddress());
-          setAddress(a);
+        // Быстрый UI (сразу), потом — попытка вытянуть basename + avatar
+        setProfileName(shortAddr(a));
+        try {
+          setProfileAvatar(addrToAvatar(a));
+        } catch {
+          setProfileAvatar(null);
         }
 
-        window.ethereum.on?.('accountsChanged', (accs2) => {
-          const a2 = accs2?.[0] || '';
-          setAddress(a2);
-          setBasename('');
-          setAvatarUrl('');
-          setNameStatus('');
-        });
-
-        window.ethereum.on?.('chainChanged', (hex) => {
-          const id = parseInt(hex, 16);
-          setChainId(id);
-        });
-      } catch {}
-    })();
-  }, []);
-
-  async function ensureWallet() {
-    setErr('');
-    setDiag('');
-    if (!window.ethereum) throw new Error('Нет wallet provider (window.ethereum). Открой в Base App / кошельке.');
-
-    const bp = new ethers.BrowserProvider(window.ethereum);
-    await bp.send('eth_requestAccounts', []);
-    const signer = await bp.getSigner();
-
-    const a = await signer.getAddress();
-    setAddress(a);
-
-    const net = await bp.getNetwork();
-    const cid = Number(net.chainId);
-    setChainId(cid);
-
-    if (cid !== CHAIN_ID) {
-      await window.ethereum.request({
-        method: 'wallet_switchEthereumChain',
-        params: [{ chainId: CHAIN_HEX }],
-      });
-      setChainId(CHAIN_ID);
-    }
-
-    return signer;
-  }
-
-  // RPC with fallback
-  async function rpc(method, params) {
-    let lastErr = null;
-    for (const url of RPC_URLS) {
-      try {
-        const result = await rpcFetch(url, method, params);
-        if (activeRpc !== url) setActiveRpc(url);
-        return result;
-      } catch (e) {
-        lastErr = e;
+        try {
+          const provider = new ethers.BrowserProvider(eth);
+          const prof = await hydrateProfile(provider, a);
+          setProfileName(prof.displayName || shortAddr(a));
+          setProfileAvatar(prof.avatarUrl || addrToAvatar(a));
+        } catch {
+          // не критично
+        }
+      } else {
+        setAddr('');
+        setStatus('Не подключено');
+        setProfileName('-');
+        setProfileAvatar(null);
       }
+
+      const cidHex = await eth.request({ method: 'eth_chainId' });
+      setChainId(parseInt(cidHex, 16));
+    } catch (e) {
+      setErr(formatError(e));
     }
-    throw new Error(lastErr?.message || 'RPC недоступен');
   }
 
-  // basename (не ломает игру, просто не найдёт если reverse не выставлен)
-  async function refreshBasename() {
+  async function connectWallet() {
     setErr('');
-    setNameStatus('Обновляю имя...');
-    setBasename('');
-    setAvatarUrl('');
-
     try {
-      if (!address) {
-        setNameStatus('Подключи кошелёк.');
+      const eth = window.ethereum;
+      if (!eth) {
+        setErr('Нет кошелька (window.ethereum). Открой в Base App / Coinbase Wallet / MetaMask.');
         return;
       }
+      await eth.request({ method: 'eth_requestAccounts' });
+      await refreshWalletState();
+    } catch (e) {
+      setErr(formatError(e));
+    }
+  }
 
-      const reverseName = `${address.slice(2).toLowerCase()}.addr.reverse`;
-      const reverseNode = ethers.namehash(reverseName);
-
-      const name = await l2ResolverRead.name(reverseNode);
-
-      if (!name) {
-        setNameStatus('Base Name не найден (reverse/primary record не выставлен).');
-        return;
-      }
-
-      setBasename(name);
+  async function switchToMainnet() {
+    setErr('');
+    try {
+      const eth = window.ethereum;
+      if (!eth) return;
 
       try {
-        const node = ethers.namehash(name);
-        const avatar = await l2ResolverRead.text(node, 'avatar');
-        const httpAvatar = ipfsToHttp(avatar);
-        if (httpAvatar) setAvatarUrl(httpAvatar);
-      } catch {}
-
-      setNameStatus('Ок.');
-    } catch (e) {
-      setNameStatus('');
-      setErr(`Имя/аватар: ${e?.message || String(e)}`);
-    }
-  }
-
-  function newRound() {
-    setErr('');
-    setDiag('');
-    setSavedTx('');
-    setHint('-');
-    setAttempts(0);
-    setGuess('');
-    setRounds((r) => r + 1);
-    setSecret(randomSecret());
-  }
-
-  function checkGuess() {
-    setErr('');
-    setDiag('');
-    setSavedTx('');
-
-    if (attempts >= MAX_ATTEMPTS) {
-      setHint('❌ Попытки закончились. Нажми "Новый раунд".');
-      return;
-    }
-
-    const g = parseInt(guess, 10);
-    if (!Number.isFinite(g)) {
-      setHint('Введи число (2–3 цифры)');
-      return;
-    }
-
-    const gg = Math.max(60, Math.min(120, g));
-    const nextAttempts = attempts + 1;
-    setAttempts(nextAttempts);
-
-    if (gg === secret) {
-      setHint('✅ Угадал!');
-      const score = calcScore(nextAttempts);
-      const guessK = gg * 1000;
-
-      setWins((w) => w + 1);
-      setBestScore((b) => Math.max(b, score));
-      setTotalScore((t) => t + score);
-      setLastWin({ guessK, score });
-      return;
-    }
-
-    if (nextAttempts >= MAX_ATTEMPTS) {
-      setHint(`❌ Попытки закончились. Было: ${secret}`);
-      return;
-    }
-
-    setHint(gg < secret ? '⬆️ Больше' : '⬇️ Меньше');
-  }
-
-  async function detectWriteMethod(signer) {
-    if (writeMethod) return writeMethod;
-
-    const from = await signer.getAddress();
-    const candidates = ['play', 'save', 'record', 'submit'];
-    const iface = new ethers.Interface(GAME_WRITE_ABI);
-
-    for (const fn of candidates) {
-      try {
-        const data = iface.encodeFunctionData(fn, [1, 1]);
-        await readProvider.call({ to: CONTRACT_ADDRESS, from, data });
-        setWriteMethod(fn);
-        return fn;
-      } catch {}
-    }
-    throw new Error('Не нашёл метод записи (play/save/record/submit) в контракте.');
-  }
-
-  async function saveOnchain() {
-    setErr('');
-    setDiag('Готовлю транзакцию...');
-    setSavedTx('');
-
-    try {
-      if (!lastWin) throw new Error('Сначала выиграй раунд (нужна “Последняя победа”).');
-
-      const signer = await ensureWallet();
-      const fn = await detectWriteMethod(signer);
-
-      const contract = new ethers.Contract(CONTRACT_ADDRESS, GAME_WRITE_ABI, signer);
-
-      setDiag('Жду окно подписи...');
-      const tx = await contract[fn](lastWin.score, lastWin.guessK, {
-        gasLimit: BigInt(parseInt(GAS_HEX, 16)),
-      });
-
-      setSavedTx(tx.hash);
-      setDiag(`TX отправлена: ${tx.hash}`);
-    } catch (e) {
-      setDiag('');
-      setErr(e?.message || String(e));
-    }
-  }
-
-  async function fetchLeaderboard() {
-    setErr('');
-    setLbStatus('Обновляю лидерборд...');
-
-    try {
-      const latestHex = await rpc('eth_blockNumber', []);
-      const latest = parseInt(latestHex, 16);
-      const fromBlock = Math.max(0, latest - LOOKBACK_BLOCKS);
-
-      const topics0 = EVENT_SIGS.map((sig) => ethers.id(sig));
-      const logs = await rpc('eth_getLogs', [
-        {
-          address: CONTRACT_ADDRESS,
-          fromBlock: intToHex(fromBlock),
-          toBlock: 'latest',
-          topics: [topics0],
-        },
-      ]);
-
-      const coder = ethers.AbiCoder.defaultAbiCoder();
-      const map = new Map();
-      const slice = logs.length > 600 ? logs.slice(logs.length - 600) : logs;
-
-      for (const l of slice) {
-        if (!l?.topics?.[1]) continue;
-        const user = ('0x' + l.topics[1].slice(26)).toLowerCase();
-
-        const decoded = coder.decode(['uint256', 'uint256', 'uint256'], l.data);
-        const score = Number(decoded[0]);
-
-        if (!map.has(user)) map.set(user, { user, total: 0, best: 0, lastTx: l.transactionHash });
-        const row = map.get(user);
-
-        row.total += score;
-        row.best = Math.max(row.best, score);
-        row.lastTx = l.transactionHash;
+        await eth.request({
+          method: 'wallet_switchEthereumChain',
+          params: [{ chainId: ACTIVE.chainIdHex }],
+        });
+      } catch (switchErr) {
+        if (switchErr?.code === 4902) {
+          await eth.request({
+            method: 'wallet_addEthereumChain',
+            params: [
+              {
+                chainId: ACTIVE.chainIdHex,
+                chainName: ACTIVE.chainName,
+                nativeCurrency: ACTIVE.nativeCurrency,
+                rpcUrls: ACTIVE.rpcUrls,
+                blockExplorerUrls: ACTIVE.blockExplorerUrls,
+              },
+            ],
+          });
+        } else {
+          throw switchErr;
+        }
       }
 
-      const top = Array.from(map.values())
-        .sort((a, b) => (b.total - a.total) || (b.best - a.best))
-        .slice(0, 10);
-
-      setLeaderboard(top);
-      setLbStatus(`Ок. Логи: ${logs.length}. RPC: ${activeRpc}`);
+      await refreshWalletState();
     } catch (e) {
-      setLeaderboard([]);
-      setLbStatus('RPC сейчас нестабилен. Нажми “Обновить лидерборд” позже.');
-      setErr(`Лидерборд: ${e?.message || String(e)}`);
+      setErr(formatError(e));
     }
   }
 
   useEffect(() => {
-    if (address) refreshBasename().catch(() => {});
+    const eth = window.ethereum;
+    setHasProvider(!!eth);
+    if (!eth) return;
+
+    const onAccountsChanged = () => refreshWalletState();
+    const onChainChanged = () => refreshWalletState();
+
+    eth.on?.('accountsChanged', onAccountsChanged);
+    eth.on?.('chainChanged', onChainChanged);
+
+    refreshWalletState();
+
+    try {
+      sdk.actions.ready();
+    } catch (e) {
+      console.log('sdk.actions.ready() skipped:', e);
+    }
+
+    return () => {
+      eth.removeListener?.('accountsChanged', onAccountsChanged);
+      eth.removeListener?.('chainChanged', onChainChanged);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [address]);
+  }, []);
+
+  // ===== Game logic =====
+  function guessNow() {
+    setErr('');
+    setTxMsg('');
+    setTxHash('');
+
+    const k = interpretedK;
+    const rangeErr = validateRangeK(k);
+    if (rangeErr) {
+      setErr(rangeErr);
+      return;
+    }
+
+    const nextAttempts = attemptsThisRound + 1;
+    setAttemptsThisRound(nextAttempts);
+
+    if (k === targetK) {
+      const roundScore = Math.max(0, MAX_ATTEMPTS - nextAttempts + 1);
+
+      setLastRoundScore(roundScore);
+      setTotalScore((s) => s + roundScore);
+      setBestRoundScore((b) => Math.max(b, roundScore));
+
+      setHint('✅ Правильно!');
+      setWins((w) => w + 1);
+      setRounds((r) => r + 1);
+
+      const win = { score: roundScore, guessK: k, ts: Date.now() };
+      setLastWin(win);
+      setLastSavedTx('');
+
+      setTimeout(() => {
+        setTargetK(randomInt(MIN_K, MAX_K));
+        setAttemptsThisRound(0);
+        setInputRaw('');
+        setHint('');
+      }, 900);
+
+      return;
+    }
+
+    if (k < targetK) setHint('⬆️ Выше');
+    else setHint('⬇️ Ниже');
+
+    if (nextAttempts >= MAX_ATTEMPTS) {
+      setRounds((r) => r + 1);
+      setHint(`❌ Раунд проигран. Было: ${targetK}k`);
+      setLastRoundScore(0);
+
+      setTimeout(() => {
+        setTargetK(randomInt(MIN_K, MAX_K));
+        setAttemptsThisRound(0);
+        setInputRaw('');
+        setHint('');
+      }, 1100);
+    }
+  }
+
+  // ===== Leaderboard =====
+  async function loadLeaderboard(force = false) {
+    setLbLoading(true);
+    setLbInfo('');
+    try {
+      const url = `/api/leaderboard?limit=10${force ? '&t=' + Date.now() : ''}`;
+      const res = await fetch(url, { cache: 'no-store' });
+      const json = await res.json();
+
+      const ok = json?.ok === true || json?.ok === 'true';
+      if (!ok) {
+        setLbRows([]);
+        setLbInfo('Лидерборд временно недоступен.');
+      } else {
+        const rows = Array.isArray(json?.rows) ? json.rows : [];
+        setLbRows(rows);
+        setLbInfo(rows.length === 0 ? 'Пока нет onchain побед. Сыграй и нажми "Сохранить результат".' : '');
+      }
+    } catch {
+      setLbRows([]);
+      setLbInfo('Лидерборд временно недоступен.');
+    } finally {
+      setLbLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    loadLeaderboard(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ===== HARD DIAG: check contract реально ли контракт и можно ли вызвать played =====
+  async function diagnose(provider) {
+    const net = await provider.getNetwork();
+    const currentChainId = Number(net.chainId);
+
+    const code = await provider.getCode(CONTRACT_ADDRESS);
+    const isContract = code && code !== '0x';
+
+    return { currentChainId, isContract, codeLen: code === '0x' ? 0 : code.length };
+  }
+
+  // ===== Onchain save =====
+  async function saveOnchain() {
+    setErr('');
+    setTxMsg('');
+    setTxHash('');
+
+    try {
+      const eth = window.ethereum;
+      if (!eth) return setErr('Нет provider (window.ethereum). Открой в кошельке (Base App/Coinbase/MetaMask).');
+
+      const accounts = await eth.request({ method: 'eth_accounts' });
+      if (!Array.isArray(accounts) || accounts.length === 0) {
+        await eth.request({ method: 'eth_requestAccounts' });
+      }
+      await refreshWalletState();
+
+      if (!lastWin) return setErr('Нет победы для сохранения. Сначала выиграй раунд.');
+
+      setIsSaving(true);
+
+      const provider = new ethers.BrowserProvider(eth);
+
+      setTxMsg('Диагностика сети/контракта...');
+      const d = await diagnose(provider);
+
+      if (d.currentChainId !== ACTIVE.chainIdDec) {
+        setIsSaving(false);
+        return setErr(
+          `Не та сеть. Сейчас chainId=${d.currentChainId}. Нужна ${ACTIVE.chainName} (${ACTIVE.chainIdDec}). Нажми "Switch to Base Mainnet".`
+        );
+      }
+
+      if (!d.isContract) {
+        setIsSaving(false);
+        return setErr(`По адресу ${CONTRACT_ADDRESS} НЕТ контракта (getCode=0x). Проверь адрес/деплой в Base Mainnet.`);
+      }
+
+      const signer = await provider.getSigner();
+      const signerAddr = await signer.getAddress();
+      if (!signerAddr) {
+        setIsSaving(false);
+        return setErr('Signer не получен (кошелёк не дал адрес).');
+      }
+
+      const contract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, signer);
+
+      setTxMsg('Пробую simulate (staticCall)...');
+      try {
+        await contract.played.staticCall(BigInt(lastWin.score), BigInt(lastWin.guessK));
+      } catch (se) {
+        console.error('staticCall error', se);
+        setTxMsg('simulate (staticCall) упал — попробую отправить транзакцию с gasLimit...');
+      }
+
+      let gasLimit = 180000n;
+      try {
+        const est = await contract.played.estimateGas(BigInt(lastWin.score), BigInt(lastWin.guessK));
+        gasLimit = est + est / 4n;
+      } catch (ge) {
+        console.error('estimateGas error', ge);
+        gasLimit = 200000n;
+      }
+
+      setTxMsg('Открываю кошелёк для подтверждения...');
+      const tx = await contract.played(BigInt(lastWin.score), BigInt(lastWin.guessK), { gasLimit });
+
+      setTxMsg('Ожидаю подтверждение...');
+      const receipt = await tx.wait();
+
+      const hash = receipt?.hash || tx?.hash || '';
+      setTxHash(hash);
+      setTxMsg('✅ Записано onchain!');
+      setLastSavedTx(hash);
+
+      await loadLeaderboard(true);
+    } catch (e) {
+      console.error('saveOnchain error', e);
+      setErr(formatError(e));
+    } finally {
+      setIsSaving(false);
+    }
+  }
 
   return (
-    <main style={{ maxWidth: 820, margin: '0 auto', padding: 16, fontFamily: 'system-ui, -apple-system, Segoe UI, Roboto, Arial' }}>
-      <h1 style={{ fontSize: 28, marginBottom: 10 }}>BaseUp — Guess BTC (k)</h1>
+    <div
+      style={{
+        minHeight: '100vh',
+        backgroundImage: "url('/bg.jpg')",
+        backgroundRepeat: 'no-repeat',
+        backgroundPosition: 'top center',
+        backgroundSize: 'contain',
+        backgroundColor: '#061a33',
+        padding: 16,
+        display: 'flex',
+        justifyContent: 'center',
+      }}
+    >
+      <main
+        style={{
+          fontFamily: 'Arial, sans-serif',
+          width: '100%',
+          maxWidth: 980,
+          background: 'rgba(255,255,255,0.92)',
+          borderRadius: 16,
+          padding: 16,
+          boxShadow: '0 8px 28px rgba(0,0,0,0.25)',
+        }}
+      >
+        <h2 style={{ marginBottom: 6 }}>Mini App: BTC Guess ({ACTIVE.chainName})</h2>
 
-      <div style={{ border: '1px solid #e5e7eb', borderRadius: 14, padding: 14, marginBottom: 14 }}>
-        <div style={{ display: 'flex', gap: 12, alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap' }}>
+        <div style={{ marginBottom: 8, color: '#444' }}>
+          Допустимые уровни: <b>{MIN_K}k</b> … <b>{MAX_K}k</b>
+        </div>
+
+        <div style={{ marginBottom: 10, color: '#444' }}>
+          Вводи число <b>{MIN_K}…{MAX_K}</b> (например: <b>69</b> = <b>69k</b> = <b>$69,000</b>). Попыток на раунд:{' '}
+          <b>{MAX_ATTEMPTS}</b>
+        </div>
+
+        {/* PROFILE CARD */}
+        <div
+          style={{
+            marginBottom: 12,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 12,
+            padding: 10,
+            border: '1px solid #e5e7eb',
+            borderRadius: 12,
+            background: '#fafbff',
+          }}
+        >
+          <div
+            style={{
+              width: 44,
+              height: 44,
+              borderRadius: '50%',
+              overflow: 'hidden',
+              border: '1px solid #e5e7eb',
+              background: '#fff',
+              flex: '0 0 44px',
+            }}
+          >
+            {profileAvatar ? (
+              <img src={profileAvatar} alt="avatar" style={{ width: '100%', height: '100%' }} />
+            ) : (
+              <div style={{ width: '100%', height: '100%', background: '#eef3f9' }} />
+            )}
+          </div>
+
+          <div style={{ lineHeight: 1.25, width: '100%' }}>
+            <div style={{ fontWeight: 700 }}>{profileName}</div>
+            <div style={{ fontSize: 12, color: '#666' }}>
+              {status}
+              {isConnected && !isCorrectChain ? ' · не та сеть' : ''}
+            </div>
+            <div style={{ fontSize: 12, color: '#8b8b8b', wordBreak: 'break-all' }}>{addr ? shortAddr(addr) : '-'}</div>
+          </div>
+        </div>
+
+        {/* TECH INFO */}
+        <div style={{ marginBottom: 10 }}>
           <div>
-            <div style={{ fontSize: 18, fontWeight: 700 }}>{address ? shortAddr(address) : 'Кошелёк не подключен'}</div>
-            <div style={{ color: '#6b7280', marginTop: 4 }}>
-              ChainId: <b>{chainId}</b> <br />
-              Контракт: <b>{CONTRACT_ADDRESS}</b>
-              <br />
-              RPC: <b style={{ fontSize: 12 }}>{activeRpc}</b>
-            </div>
-
-            <div style={{ marginTop: 10 }}>
-              <div style={{ fontWeight: 700 }}>Base Name:</div>
-              <div style={{ color: basename ? '#111827' : '#b91c1c', marginTop: 2 }}>
-                {basename ? basename : 'не найден (скорее всего не выставлен reverse/primary record).'}
-              </div>
-
-              {avatarUrl ? (
-                <div style={{ marginTop: 10, display: 'flex', alignItems: 'center', gap: 10 }}>
-                  <img src={avatarUrl} alt="avatar" width={44} height={44} style={{ borderRadius: 12, border: '1px solid #e5e7eb' }} />
-                  <span style={{ color: '#6b7280', fontSize: 13 }}>avatar</span>
-                </div>
-              ) : null}
-
-              <div style={{ marginTop: 8, color: '#6b7280', fontSize: 13 }}>{nameStatus}</div>
-            </div>
+            <b>ChainId:</b> {chainId ?? '-'}
           </div>
-
-          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-            <button onClick={refreshBasename} style={btnStyle}>Обновить Base Name</button>
-            <button onClick={newRound} style={btnStyle}>Новый раунд</button>
-            <button onClick={saveOnchain} style={{ ...btnStyle, fontWeight: 800 }}>Сохранить результат (onchain)</button>
-          </div>
-        </div>
-      </div>
-
-      <div style={{ border: '1px solid #e5e7eb', borderRadius: 14, padding: 14, marginBottom: 14 }}>
-        <h2 style={{ fontSize: 18, margin: 0, marginBottom: 10 }}>Угадай уровень BTC (k): введи 60…120</h2>
-
-        <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
-          <input
-            value={guess}
-            onChange={(e) => setGuess(e.target.value)}
-            placeholder="например 69"
-            inputMode="numeric"
-            style={{ padding: '10px 12px', borderRadius: 12, border: '1px solid #e5e7eb', fontSize: 16, width: 180 }}
-          />
-          <button onClick={checkGuess} style={btnStyle}>Проверить</button>
-          <div style={{ color: '#6b7280' }}>Введите число (2–3 цифры)</div>
-        </div>
-
-        <div style={{ marginTop: 12, fontSize: 18 }}>
-          <b>Подсказка:</b> {hint}
-        </div>
-
-        <div style={{ marginTop: 10, color: '#111827' }}>
-          Попыток (в этом раунде): <b>{Math.min(attempts, MAX_ATTEMPTS)}</b> / {MAX_ATTEMPTS} <br />
-          Раунды: <b>{rounds}</b> <br />
-          Победы: <b>{wins}</b> <br />
-          Лучший результат за раунд: <b>{bestScore}</b> <br />
-          Суммарные очки (total): <b>{totalScore}</b>
-        </div>
-
-        <div style={{ marginTop: 12, padding: 12, borderRadius: 14, background: '#f9fafb', border: '1px solid #e5e7eb' }}>
-          <b>Последняя победа (для onchain):</b>
-          <div style={{ marginTop: 6, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace' }}>
-            guess: <b>{lastWin ? `${Math.floor(lastWin.guessK / 1000)}k` : '-'}</b> <br />
-            score: <b>{lastWin ? lastWin.score : '-'}</b> <br />
-            saved tx: <b>{savedTx ? savedTx : '-'}</b>
+          <div style={{ wordBreak: 'break-all' }}>
+            <b>Контракт:</b> {CONTRACT_ADDRESS}
           </div>
         </div>
 
-        {diag ? <div style={{ marginTop: 12, color: '#047857', fontWeight: 700 }}>{diag}</div> : null}
-        {err ? <div style={{ marginTop: 12, color: '#b91c1c', fontWeight: 800 }}>Ошибка: {err}</div> : null}
-      </div>
+        <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 14 }}>
+          {!isConnected && (
+            <button style={{ padding: '10px 14px' }} onClick={connectWallet} disabled={!hasProvider}>
+              Подключить кошелёк
+            </button>
+          )}
 
-      <div style={{ border: '1px solid #e5e7eb', borderRadius: 14, padding: 14 }}>
-        <div style={{ display: 'flex', gap: 10, alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap' }}>
-          <h2 style={{ fontSize: 18, margin: 0 }}>Leaderboard (top-10, sum score)</h2>
-          <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
-            <button onClick={fetchLeaderboard} style={btnStyle}>Обновить лидерборд</button>
-            <span style={{ color: '#6b7280', fontSize: 13 }}>{lbStatus}</span>
-          </div>
+          {isConnected && !isCorrectChain && (
+            <button style={{ padding: '10px 14px' }} onClick={switchToMainnet}>
+              Switch to Base Mainnet
+            </button>
+          )}
+
+          <button style={{ padding: '10px 14px' }} onClick={resetRound}>
+            Новый раунд
+          </button>
+
+          <button
+            style={{ padding: '10px 14px' }}
+            onClick={saveOnchain}
+            disabled={!hasProvider || !lastWin || isSaving}
+            title={!lastWin ? 'Сначала выиграй раунд' : 'Записать победу onchain'}
+          >
+            {isSaving ? 'Сохраняю…' : 'Сохранить результат (onchain)'}
+          </button>
+
+          <button style={{ padding: '10px 14px' }} onClick={() => loadLeaderboard(true)} disabled={lbLoading}>
+            {lbLoading ? 'Обновляю…' : 'Обновить лидерборд'}
+          </button>
         </div>
 
-        <div style={{ marginTop: 12, overflowX: 'auto' }}>
-          <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 520 }}>
-            <thead>
-              <tr>
-                <th style={th}>#</th>
-                <th style={th}>Address</th>
-                <th style={th}>Total</th>
-                <th style={th}>Best</th>
-                <th style={th}>Last Tx</th>
-              </tr>
-            </thead>
-            <tbody>
-              {leaderboard.length === 0 ? (
-                <tr>
-                  <td colSpan={5} style={{ padding: 12, color: '#6b7280' }}>
-                    Нет данных (или пока не обновлял лидерборд).
-                  </td>
-                </tr>
+        <div style={{ marginBottom: 10 }}>
+          <div style={{ marginBottom: 6 }}>
+            <b>Угадай уровень BTC (k):</b> введи <b>{MIN_K}…{MAX_K}</b>
+          </div>
+
+          <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+            <input
+              value={inputRaw}
+              onChange={onInputChange}
+              inputMode="numeric"
+              placeholder="например 69"
+              style={{ width: 180, padding: '10px 12px', fontSize: 16 }}
+              maxLength={3}
+            />
+
+            <button style={{ padding: '10px 14px' }} onClick={guessNow}>
+              Проверить
+            </button>
+
+            <div style={{ color: '#333' }}>
+              {interpretedK !== null ? (
+                <span>
+                  Интерпретируется как <b>{interpretedLabel}</b> (<b>${interpretedUsd?.toLocaleString('en-US')}</b>)
+                </span>
               ) : (
-                leaderboard.map((r, i) => (
-                  <tr key={r.user}>
-                    <td style={td}>{i + 1}</td>
-                    <td style={td}>{shortAddr(r.user)}</td>
-                    <td style={td}>{r.total}</td>
-                    <td style={td}>{r.best}</td>
-                    <td style={{ ...td, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace', fontSize: 12 }}>
-                      {r.lastTx ? shortAddr(r.lastTx) : '-'}
-                    </td>
-                  </tr>
-                ))
+                <span style={{ color: '#777' }}>Введите число (2–3 цифры)</span>
               )}
-            </tbody>
-          </table>
+            </div>
+          </div>
         </div>
 
-        <div style={{ marginTop: 10, color: '#6b7280', fontSize: 12 }}>
-          Лидерборд берётся из логов за последние {LOOKBACK_BLOCKS.toLocaleString()} блоков. Если RPC лёг — просто нажми позже.
+        <div style={{ marginBottom: 12 }}>
+          <b>Подсказка:</b> <span style={{ marginLeft: 8 }}>{hint || '-'}</span>
         </div>
-      </div>
-    </main>
+
+        <div style={{ marginBottom: 12 }}>
+          <div>
+            Попыток (в этом раунде): <b>{attemptsThisRound}</b> / {MAX_ATTEMPTS}
+          </div>
+          <div>
+            Раунды: <b>{rounds}</b>
+          </div>
+          <div>
+            Победы: <b>{wins}</b>
+          </div>
+          <div>
+            Очки за последнюю победу: <b>{lastRoundScore}</b>
+          </div>
+          <div>
+            Лучший результат за раунд: <b>{bestRoundScore}</b>
+          </div>
+          <div>
+            Суммарные очки (total): <b>{totalScore}</b>
+          </div>
+        </div>
+
+        <div style={{ padding: 12, border: '1px solid #ddd', borderRadius: 10, marginBottom: 14 }}>
+          <div style={{ marginBottom: 6 }}>
+            <b>Последняя победа (для onchain):</b>
+          </div>
+          {lastWin ? (
+            <div>
+              <div>
+                guess: <b>{lastWin.guessK}k</b>
+              </div>
+              <div>
+                score: <b>{lastWin.score}</b>
+              </div>
+              <div style={{ wordBreak: 'break-all' }}>
+                saved tx: <b>{lastSavedTx ? lastSavedTx : '-'}</b>
+              </div>
+            </div>
+          ) : (
+            <div style={{ color: '#666' }}>Пока нет победы.</div>
+          )}
+        </div>
+
+        <div style={{ padding: 12, border: '1px solid #ddd', borderRadius: 10 }}>
+          <div style={{ marginBottom: 6 }}>
+            <b>Leaderboard (onchain)</b>
+          </div>
+
+          {lbInfo && <div style={{ color: '#666', marginBottom: 8 }}>{lbInfo}</div>}
+
+          {lbRows.length > 0 && (
+            <div style={{ overflowX: 'auto' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                <thead>
+                  <tr>
+                    <th style={{ textAlign: 'left', borderBottom: '1px solid #eee', padding: 8 }}>#</th>
+                    <th style={{ textAlign: 'left', borderBottom: '1px solid #eee', padding: 8 }}>Address</th>
+                    <th style={{ textAlign: 'left', borderBottom: '1px solid #eee', padding: 8 }}>Best score</th>
+                    <th style={{ textAlign: 'left', borderBottom: '1px solid #eee', padding: 8 }}>Guess</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {lbRows.map((r, i) => (
+                    <tr key={`${r.user}-${i}`}>
+                      <td style={{ borderBottom: '1px solid #f2f2f2', padding: 8 }}>{i + 1}</td>
+                      <td style={{ borderBottom: '1px solid #f2f2f2', padding: 8, wordBreak: 'break-all' }}>{r.user}</td>
+                      <td style={{ borderBottom: '1px solid #f2f2f2', padding: 8 }}>
+                        <b>{r.score}</b>
+                      </td>
+                      <td style={{ borderBottom: '1px solid #f2f2f2', padding: 8 }}>{r.guessK}k</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+
+        {txMsg && (
+          <div style={{ marginTop: 12 }}>
+            <b>Onchain:</b> {txMsg}
+            {txHash && (
+              <div style={{ wordBreak: 'break-all', marginTop: 6 }}>
+                <b>Tx:</b>{' '}
+                <a href={`${ACTIVE.blockExplorerUrls[0]}/tx/${txHash}`} target="_blank" rel="noreferrer">
+                  {txHash}
+                </a>
+              </div>
+            )}
+          </div>
+        )}
+
+        {err && (
+          <div style={{ marginTop: 12, color: 'crimson', whiteSpace: 'pre-wrap' }}>
+            <b>Ошибка:</b> {err}
+          </div>
+        )}
+      </main>
+    </div>
   );
 }
-
-const btnStyle = {
-  padding: '10px 12px',
-  borderRadius: 12,
-  border: '1px solid #e5e7eb',
-  background: 'white',
-  cursor: 'pointer',
-};
-
-const th = {
-  textAlign: 'left',
-  padding: '10px 8px',
-  borderBottom: '1px solid #e5e7eb',
-  color: '#374151',
-  fontSize: 13,
-};
-
-const td = {
-  padding: '10px 8px',
-  borderBottom: '1px solid #f3f4f6',
-  fontSize: 14,
-};
