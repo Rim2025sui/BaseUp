@@ -4,33 +4,38 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { ethers } from 'ethers';
 
 /**
- * ВАЖНО:
- * 1) Пишем транзы через BrowserProvider (wallet)
- * 2) Читаем basename + логи через JsonRpcProvider (публичный RPC) — стабильно, без BAD_DATA
+ * FIXES:
+ * - Attempts never goes above 7 (no "8/7")
+ * - Leaderboard uses raw JSON-RPC eth_getLogs (no ENS / no getEnsAddress)
+ * - Basename + avatar via Basenames L2 Resolver (no resolver(bytes32) -> no BAD_DATA)
  */
 
-// === НАСТРОЙКИ ===
+// === CONFIG ===
 const CHAIN_ID = 8453;
-const CONTRACT_ADDRESS = '0x622678862992c0A2414b536Bc4B8B391602BCf';
+const CHAIN_HEX = '0x2105';
 
-// Basenames L2 Resolver (из Base docs / гайда)
-const BASENAME_L2_RESOLVER_ADDRESS = '0xC6d566A56A1aFf6508b41f6c90ff131615583BCD';
-
-// Публичный RPC (для чтения/логов)
 const READ_RPC_URL = 'https://mainnet.base.org';
 
-// Сколько блоков назад читать лидерборд (чтобы не упираться в лимиты)
-const LOOKBACK_BLOCKS = 80_000; // ~несколько дней на Base
+const CONTRACT_ADDRESS = '0x622678862992c0A2414b536Bc4B8B391602BCf';
 
-// === ABI (минимально нужное) ===
-// 1) L2 Resolver: name(bytes32) + text(bytes32,string)
+// Basenames L2 Resolver (Base docs)
+const BASENAME_L2_RESOLVER_ADDRESS = '0xC6d566A56A1aFf6508b41f6c90ff131615583BCD';
+
+// Leaderboard lookback (не 200k)
+const LOOKBACK_BLOCKS = 80_000;
+
+// max attempts
+const MAX_ATTEMPTS = 7;
+
+// fixed gas for write
+const GAS_HEX = '0x249F0'; // 150000
+
+// === ABI ===
 const L2_RESOLVER_ABI = [
   'function name(bytes32 node) view returns (string)',
   'function text(bytes32 node, string key) view returns (string)',
 ];
 
-// 2) Контракт игры: мы не знаем точное имя функции (ты мог менять),
-// поэтому: поддержим несколько вариантов и выберем рабочий через eth_call.
 const GAME_WRITE_ABI = [
   'function play(uint256 score, uint256 guess)',
   'function save(uint256 score, uint256 guess)',
@@ -38,13 +43,13 @@ const GAME_WRITE_ABI = [
   'function submit(uint256 score, uint256 guess)',
 ];
 
-// События (поддержим 2 имени — на всякий)
+// event candidates (user is indexed!)
 const EVENT_SIGS = [
   'Played(address,uint256,uint256,uint256)',
   'GamePlayed(address,uint256,uint256,uint256)',
 ];
 
-// === УТИЛИТЫ ===
+// === utils ===
 function shortAddr(a) {
   if (!a) return '';
   return a.slice(0, 6) + '…' + a.slice(-4);
@@ -60,43 +65,61 @@ function ipfsToHttp(url) {
 }
 
 function calcScore(attemptsUsed) {
-  // У тебя на скрине: попыток 5/7 => score 3
-  // 8 - 5 = 3
+  // 1..7 attempts -> score 7..1 (как у тебя было)
+  // attemptsUsed=5 => score=3
   return Math.max(1, 8 - attemptsUsed);
 }
 
-function clampInt(n, min, max) {
-  return Math.max(min, Math.min(max, n));
+function randomSecret() {
+  return 60 + Math.floor(Math.random() * 61); // 60..120
+}
+
+function intToHex(n) {
+  return '0x' + Number(n).toString(16);
+}
+
+async function rpc(method, params) {
+  const res = await fetch(READ_RPC_URL, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+  });
+  const j = await res.json();
+  if (j.error) throw new Error(j.error.message || 'RPC error');
+  return j.result;
 }
 
 export default function Page() {
-  // providers
-  const readProvider = useMemo(() => new ethers.JsonRpcProvider(READ_RPC_URL, { chainId: CHAIN_ID, name: 'base' }), []);
-  const l2ResolverRead = useMemo(() => new ethers.Contract(BASENAME_L2_RESOLVER_ADDRESS, L2_RESOLVER_ABI, readProvider), [readProvider]);
+  // READ provider for contract calls (no network name -> no ENS ops)
+  const readProvider = useMemo(() => new ethers.JsonRpcProvider(READ_RPC_URL), []);
+  const l2ResolverRead = useMemo(
+    () => new ethers.Contract(BASENAME_L2_RESOLVER_ADDRESS, L2_RESOLVER_ABI, readProvider),
+    [readProvider]
+  );
 
-  // wallet state
+  // wallet
   const [address, setAddress] = useState('');
   const [chainId, setChainId] = useState(CHAIN_ID);
 
-  // basename state
+  // basename
   const [basename, setBasename] = useState('');
   const [avatarUrl, setAvatarUrl] = useState('');
   const [nameStatus, setNameStatus] = useState('');
 
-  // game state
-  const [secret, setSecret] = useState(() => 60 + Math.floor(Math.random() * 61)); // 60..120
+  // game
+  const [secret, setSecret] = useState(() => randomSecret());
   const [guess, setGuess] = useState('');
   const [hint, setHint] = useState('-');
   const [attempts, setAttempts] = useState(0);
   const [wins, setWins] = useState(0);
   const [rounds, setRounds] = useState(1);
 
-  // scoring state
+  // scoring
   const [lastWin, setLastWin] = useState(null); // { guessK, score }
   const [bestScore, setBestScore] = useState(0);
   const [totalScore, setTotalScore] = useState(0);
 
-  // tx/diagnostics
+  // tx/diag
   const [diag, setDiag] = useState('');
   const [err, setErr] = useState('');
   const [savedTx, setSavedTx] = useState('');
@@ -105,13 +128,13 @@ export default function Page() {
   const [leaderboard, setLeaderboard] = useState([]);
   const [lbStatus, setLbStatus] = useState('');
 
-  // выбранный метод записи (play/save/record/submit)
+  // write method cache
   const [writeMethod, setWriteMethod] = useState('');
 
-  // === LOAD/STORE localStorage (чтобы не терялось) ===
+  // persist game state
   useEffect(() => {
     try {
-      const raw = localStorage.getItem('baseup_state_v1');
+      const raw = localStorage.getItem('baseup_state_v2');
       if (!raw) return;
       const s = JSON.parse(raw);
       if (typeof s.secret === 'number') setSecret(s.secret);
@@ -127,17 +150,16 @@ export default function Page() {
   useEffect(() => {
     try {
       localStorage.setItem(
-        'baseup_state_v1',
+        'baseup_state_v2',
         JSON.stringify({ secret, attempts, wins, rounds, bestScore, totalScore, lastWin })
       );
     } catch {}
   }, [secret, attempts, wins, rounds, bestScore, totalScore, lastWin]);
 
-  // === Wallet connect (лениво, без лишних кнопок) ===
+  // wallet listeners
   useEffect(() => {
     (async () => {
       try {
-        if (typeof window === 'undefined') return;
         if (!window.ethereum) return;
 
         const bp = new ethers.BrowserProvider(window.ethereum);
@@ -145,18 +167,19 @@ export default function Page() {
         setChainId(Number(net.chainId));
 
         const accs = await bp.listAccounts();
-        if (accs && accs.length) {
+        if (accs?.length) {
           const a = await bp.getSigner().then((s) => s.getAddress());
           setAddress(a);
         }
 
-        // подписки
         window.ethereum.on?.('accountsChanged', (accs2) => {
-          const a2 = (accs2 && accs2[0]) ? accs2[0] : '';
+          const a2 = accs2?.[0] || '';
           setAddress(a2);
           setBasename('');
           setAvatarUrl('');
+          setNameStatus('');
         });
+
         window.ethereum.on?.('chainChanged', (hex) => {
           const id = parseInt(hex, 16);
           setChainId(id);
@@ -169,36 +192,33 @@ export default function Page() {
     setErr('');
     setDiag('');
     if (!window.ethereum) throw new Error('Нет wallet provider (window.ethereum). Открой в Base App / кошельке.');
-    const bp = new ethers.BrowserProvider(window.ethereum);
 
-    // request accounts
+    const bp = new ethers.BrowserProvider(window.ethereum);
     await bp.send('eth_requestAccounts', []);
+
     const signer = await bp.getSigner();
     const a = await signer.getAddress();
     setAddress(a);
 
-    // chain check
     const net = await bp.getNetwork();
     const cid = Number(net.chainId);
     setChainId(cid);
 
     if (cid !== CHAIN_ID) {
-      // попросим переключиться
       try {
         await window.ethereum.request({
           method: 'wallet_switchEthereumChain',
-          params: [{ chainId: '0x2105' }], // 8453
+          params: [{ chainId: CHAIN_HEX }],
         });
         setChainId(CHAIN_ID);
-      } catch (e) {
-        throw new Error('Переключи сеть на Base (8453), потом снова жми Save onchain.');
+      } catch {
+        throw new Error('Переключи сеть на Base (8453) и повтори.');
       }
     }
-
     return signer;
   }
 
-  // === Basename resolve (БЕЗ resolver(bytes32)) ===
+  // basename (no resolver(bytes32))
   async function refreshBasename() {
     setErr('');
     setNameStatus('Обновляю имя...');
@@ -207,25 +227,22 @@ export default function Page() {
 
     try {
       if (!address) {
-        setNameStatus('Подключи кошелёк (нажми Save onchain — он сам запросит подключение).');
+        setNameStatus('Подключи кошелёк.');
         return;
       }
 
-      // стандартный ENS reverse: <addr>.addr.reverse
       const reverseName = `${address.slice(2).toLowerCase()}.addr.reverse`;
       const reverseNode = ethers.namehash(reverseName);
 
       const name = await l2ResolverRead.name(reverseNode);
+
       if (!name) {
-        setBasename('');
-        setAvatarUrl('');
         setNameStatus('Base Name не найден (reverse/primary record не выставлен).');
         return;
       }
 
       setBasename(name);
 
-      // avatar через text record "avatar"
       try {
         const node = ethers.namehash(name);
         const avatar = await l2ResolverRead.text(node, 'avatar');
@@ -240,7 +257,7 @@ export default function Page() {
     }
   }
 
-  // === ИГРА ===
+  // game controls
   function newRound() {
     setErr('');
     setDiag('');
@@ -249,7 +266,7 @@ export default function Page() {
     setAttempts(0);
     setGuess('');
     setRounds((r) => r + 1);
-    setSecret(60 + Math.floor(Math.random() * 61));
+    setSecret(randomSecret());
   }
 
   function checkGuess() {
@@ -257,13 +274,19 @@ export default function Page() {
     setDiag('');
     setSavedTx('');
 
+    // FIX: never allow attempts > 7
+    if (attempts >= MAX_ATTEMPTS) {
+      setHint('❌ Попытки закончились. Нажми "Новый раунд".');
+      return;
+    }
+
     const g = parseInt(guess, 10);
     if (!Number.isFinite(g)) {
       setHint('Введи число (2–3 цифры)');
       return;
     }
-    const gg = clampInt(g, 60, 120);
 
+    const gg = Math.max(60, Math.min(120, g));
     const nextAttempts = attempts + 1;
     setAttempts(nextAttempts);
 
@@ -280,15 +303,14 @@ export default function Page() {
       return;
     }
 
-    if (nextAttempts >= 7) {
-      setHint(`❌ Не угадал. Было: ${secret}`);
+    if (nextAttempts >= MAX_ATTEMPTS) {
+      setHint(`❌ Попытки закончились. Было: ${secret}`);
       return;
     }
 
     setHint(gg < secret ? '⬆️ Больше' : '⬇️ Меньше');
   }
 
-  // === Автовыбор метода записи (play/save/record/submit) ===
   async function detectWriteMethod(signer) {
     if (writeMethod) return writeMethod;
 
@@ -296,44 +318,40 @@ export default function Page() {
     const candidates = ['play', 'save', 'record', 'submit'];
     const iface = new ethers.Interface(GAME_WRITE_ABI);
 
-    // пробуем eth_call на каждом селекторе
     for (const fn of candidates) {
       try {
-        const data = iface.encodeFunctionData(fn, [1, 1]); // тестовые аргументы
+        const data = iface.encodeFunctionData(fn, [1, 1]);
+        // call via READ provider (safe)
         await readProvider.call({ to: CONTRACT_ADDRESS, from, data });
         setWriteMethod(fn);
         return fn;
-      } catch {
-        // не этот
-      }
+      } catch {}
     }
-    throw new Error('Не нашёл метод записи в контракте (play/save/record/submit).');
+    throw new Error('Не нашёл метод записи (play/save/record/submit) в контракте.');
   }
 
-  // === SAVE ONCHAIN ===
   async function saveOnchain() {
     setErr('');
     setDiag('Диагностика: готовлю транзакцию...');
     setSavedTx('');
 
     try {
-      if (!lastWin) {
-        throw new Error('Сначала выиграй раунд (нужна “Последняя победа”).');
-      }
+      if (!lastWin) throw new Error('Сначала выиграй раунд (нужна “Последняя победа”).');
 
       const signer = await ensureWallet();
-
-      // метод
       const fn = await detectWriteMethod(signer);
 
       const contract = new ethers.Contract(CONTRACT_ADDRESS, GAME_WRITE_ABI, signer);
 
-      // важно: guessK и score
-      const tx = await contract[fn](lastWin.score, lastWin.guessK);
+      // send tx (score, guessK)
+      setDiag('Диагностика: жду окно подписи...');
+      const tx = await contract[fn](lastWin.score, lastWin.guessK, {
+        gasLimit: BigInt(parseInt(GAS_HEX, 16)),
+      });
+
       setSavedTx(tx.hash);
       setDiag(`Диагностика: TX отправлена: ${tx.hash}`);
 
-      // обновим лидерборд
       await fetchLeaderboard();
     } catch (e) {
       setDiag('');
@@ -341,57 +359,54 @@ export default function Page() {
     }
   }
 
-  // === LEADERBOARD (из логов) ===
+  // LEADERBOARD: raw RPC eth_getLogs (NO ENS)
   async function fetchLeaderboard() {
+    setErr('');
     setLbStatus('Обновляю лидерборд...');
+
     try {
-      const latest = await readProvider.getBlockNumber();
+      const latestHex = await rpc('eth_blockNumber', []);
+      const latest = parseInt(latestHex, 16);
       const fromBlock = Math.max(0, latest - LOOKBACK_BLOCKS);
 
-      const topics = EVENT_SIGS.map((sig) => ethers.id(sig));
+      const topics0 = EVENT_SIGS.map((sig) => ethers.id(sig)); // keccak
+      const logs = await rpc('eth_getLogs', [
+        {
+          address: CONTRACT_ADDRESS,
+          fromBlock: intToHex(fromBlock),
+          toBlock: 'latest',
+          topics: [topics0],
+        },
+      ]);
 
-      const logs = await readProvider.getLogs({
-        address: CONTRACT_ADDRESS,
-        fromBlock,
-        toBlock: 'latest',
-        topics: [topics],
-      });
-
-      // декодим одинаково (address,uint256,uint256,uint256)
+      // decode: user is topics[1] (indexed), data has 3 uint256: score, guess, ts
       const coder = ethers.AbiCoder.defaultAbiCoder();
-
-      const rows = logs
-        .slice(-300) // ограничим, чтобы UI не умирал
-        .map((l) => {
-          const decoded = coder.decode(['address', 'uint256', 'uint256', 'uint256'], l.data);
-          return {
-            user: decoded[0],
-            score: Number(decoded[1]),
-            guess: Number(decoded[2]),
-            ts: Number(decoded[3]),
-            tx: l.transactionHash,
-            block: Number(l.blockNumber),
-          };
-        })
-        .sort((a, b) => b.block - a.block);
-
-      // агрегируем топ-10 по суммарному score
       const map = new Map();
-      for (const r of rows) {
-        const key = r.user.toLowerCase();
-        const prev = map.get(key) || { user: r.user, total: 0, best: 0, lastTx: r.tx };
-        prev.total += r.score;
-        prev.best = Math.max(prev.best, r.score);
-        prev.lastTx = r.tx;
-        map.set(key, prev);
+
+      // limit processing to last N logs to keep UI fast
+      const slice = logs.length > 600 ? logs.slice(logs.length - 600) : logs;
+
+      for (const l of slice) {
+        if (!l?.topics?.[1]) continue;
+
+        const user = ('0x' + l.topics[1].slice(26)).toLowerCase();
+        const decoded = coder.decode(['uint256', 'uint256', 'uint256'], l.data);
+        const score = Number(decoded[0]);
+
+        if (!map.has(user)) map.set(user, { user, total: 0, best: 0, lastTx: l.transactionHash });
+        const row = map.get(user);
+
+        row.total += score;
+        row.best = Math.max(row.best, score);
+        row.lastTx = l.transactionHash;
       }
 
       const top = Array.from(map.values())
-        .sort((a, b) => b.total - a.total)
+        .sort((a, b) => (b.total - a.total) || (b.best - a.best))
         .slice(0, 10);
 
       setLeaderboard(top);
-      setLbStatus(`Ок. Событий за lookback: ${logs.length}`);
+      setLbStatus(`Ок. Событий в lookback: ${logs.length}`);
     } catch (e) {
       setLeaderboard([]);
       setLbStatus('');
@@ -399,14 +414,13 @@ export default function Page() {
     }
   }
 
+  // initial load
   useEffect(() => {
-    // на старте подтянуть лидерборд
     fetchLeaderboard().catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
-    // при смене адреса — обновить basename
     if (address) refreshBasename().catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [address]);
@@ -429,26 +443,22 @@ export default function Page() {
               <div style={{ color: basename ? '#111827' : '#b91c1c', marginTop: 2 }}>
                 {basename ? basename : 'не найден (скорее всего не выставлен reverse/primary record).'}
               </div>
+
               {avatarUrl ? (
                 <div style={{ marginTop: 10, display: 'flex', alignItems: 'center', gap: 10 }}>
                   <img src={avatarUrl} alt="avatar" width={44} height={44} style={{ borderRadius: 12, border: '1px solid #e5e7eb' }} />
                   <span style={{ color: '#6b7280', fontSize: 13 }}>avatar (text record)</span>
                 </div>
               ) : null}
+
               <div style={{ marginTop: 8, color: '#6b7280', fontSize: 13 }}>{nameStatus}</div>
             </div>
           </div>
 
           <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-            <button onClick={refreshBasename} style={btnStyle}>
-              Обновить Base Name
-            </button>
-            <button onClick={newRound} style={btnStyle}>
-              Новый раунд
-            </button>
-            <button onClick={saveOnchain} style={{ ...btnStyle, fontWeight: 800 }}>
-              Сохранить результат (onchain)
-            </button>
+            <button onClick={refreshBasename} style={btnStyle}>Обновить Base Name</button>
+            <button onClick={newRound} style={btnStyle}>Новый раунд</button>
+            <button onClick={saveOnchain} style={{ ...btnStyle, fontWeight: 800 }}>Сохранить результат (onchain)</button>
           </div>
         </div>
       </div>
@@ -462,17 +472,9 @@ export default function Page() {
             onChange={(e) => setGuess(e.target.value)}
             placeholder="например 69"
             inputMode="numeric"
-            style={{
-              padding: '10px 12px',
-              borderRadius: 12,
-              border: '1px solid #e5e7eb',
-              fontSize: 16,
-              width: 180,
-            }}
+            style={{ padding: '10px 12px', borderRadius: 12, border: '1px solid #e5e7eb', fontSize: 16, width: 180 }}
           />
-          <button onClick={checkGuess} style={btnStyle}>
-            Проверить
-          </button>
+          <button onClick={checkGuess} style={btnStyle}>Проверить</button>
           <div style={{ color: '#6b7280' }}>Введите число (2–3 цифры)</div>
         </div>
 
@@ -481,7 +483,7 @@ export default function Page() {
         </div>
 
         <div style={{ marginTop: 10, color: '#111827' }}>
-          Попыток (в этом раунде): <b>{attempts}</b> / 7 <br />
+          Попыток (в этом раунде): <b>{Math.min(attempts, MAX_ATTEMPTS)}</b> / {MAX_ATTEMPTS} <br />
           Раунды: <b>{rounds}</b> <br />
           Победы: <b>{wins}</b> <br />
           Лучший результат за раунд: <b>{bestScore}</b> <br />
@@ -505,9 +507,7 @@ export default function Page() {
         <div style={{ display: 'flex', gap: 10, alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap' }}>
           <h2 style={{ fontSize: 18, margin: 0 }}>Leaderboard (top-10, sum score)</h2>
           <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
-            <button onClick={fetchLeaderboard} style={btnStyle}>
-              Обновить лидерборд
-            </button>
+            <button onClick={fetchLeaderboard} style={btnStyle}>Обновить лидерборд</button>
             <span style={{ color: '#6b7280', fontSize: 13 }}>{lbStatus}</span>
           </div>
         </div>
@@ -548,7 +548,7 @@ export default function Page() {
         </div>
 
         <div style={{ marginTop: 10, color: '#6b7280', fontSize: 12 }}>
-          Примечание: лидерборд берётся из событий контракта за последние {LOOKBACK_BLOCKS.toLocaleString()} блоков (чтобы не упираться в лимиты RPC).
+          Лидерборд берётся из логов за последние {LOOKBACK_BLOCKS.toLocaleString()} блоков (без ENS).
         </div>
       </div>
     </main>
