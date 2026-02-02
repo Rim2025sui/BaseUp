@@ -1,362 +1,578 @@
-"use client";
+'use client';
 
-import React, { useEffect, useMemo, useState } from "react";
-import { ethers } from "ethers";
+import React, { useEffect, useMemo, useState } from 'react';
+import { ethers } from 'ethers';
 
-// =======================
-// CONFIG
-// =======================
-const BASE_CHAIN_ID = 8453;
-const CONTRACT_ADDRESS = "0x622678862992c0A2414b536Bc4B8B391602BCf";
+/**
+ * ВАЖНО:
+ * 1) Пишем транзы через BrowserProvider (wallet)
+ * 2) Читаем basename + логи через JsonRpcProvider (публичный RPC) — стабильно, без BAD_DATA
+ */
 
-// 1) Имя write-функции в контракте (если не "play" — поменяй ОДНО слово)
-const WRITE_METHOD = "play";
+// === НАСТРОЙКИ ===
+const CHAIN_ID = 8453;
+const CONTRACT_ADDRESS = '0x622678862992c0A2414b536Bc4B8B391602BCf';
 
-// 2) Порядок аргументов (у тебя событие было score, guess — поэтому true)
-const SEND_SCORE_FIRST = true;
+// Basenames L2 Resolver (из Base docs / гайда)
+const BASENAME_L2_RESOLVER_ADDRESS = '0xC6d566A56A1aFf6508b41f6c90ff131615583BCD';
 
-// 3) Газ фиксируем (чтобы кошелёк не делал estimateGas)
-const GAS_HEX = "0x249F0"; // 150000
+// Публичный RPC (для чтения/логов)
+const READ_RPC_URL = 'https://mainnet.base.org';
 
-// ABI: только write-функция на 2 uint256
-const ABI = [
-  {
-    inputs: [
-      { internalType: "uint256", name: "a", type: "uint256" },
-      { internalType: "uint256", name: "b", type: "uint256" },
-    ],
-    name: WRITE_METHOD,
-    outputs: [],
-    stateMutability: "nonpayable",
-    type: "function",
-  },
+// Сколько блоков назад читать лидерборд (чтобы не упираться в лимиты)
+const LOOKBACK_BLOCKS = 80_000; // ~несколько дней на Base
+
+// === ABI (минимально нужное) ===
+// 1) L2 Resolver: name(bytes32) + text(bytes32,string)
+const L2_RESOLVER_ABI = [
+  'function name(bytes32 node) view returns (string)',
+  'function text(bytes32 node, string key) view returns (string)',
 ];
 
-// =======================
-// Utils
-// =======================
-function clampInt(n, lo, hi) {
-  const x = Number(n);
-  if (!Number.isFinite(x)) return null;
-  const y = Math.trunc(x);
-  if (y < lo || y > hi) return null;
-  return y;
-}
+// 2) Контракт игры: мы не знаем точное имя функции (ты мог менять),
+// поэтому: поддержим несколько вариантов и выберем рабочий через eth_call.
+const GAME_WRITE_ABI = [
+  'function play(uint256 score, uint256 guess)',
+  'function save(uint256 score, uint256 guess)',
+  'function record(uint256 score, uint256 guess)',
+  'function submit(uint256 score, uint256 guess)',
+];
 
-function randomInt(lo, hi) {
-  return lo + Math.floor(Math.random() * (hi - lo + 1));
-}
+// События (поддержим 2 имени — на всякий)
+const EVENT_SIGS = [
+  'Played(address,uint256,uint256,uint256)',
+  'GamePlayed(address,uint256,uint256,uint256)',
+];
 
+// === УТИЛИТЫ ===
 function shortAddr(a) {
-  if (!a || typeof a !== "string") return "";
-  return a.slice(0, 6) + "…" + a.slice(-4);
+  if (!a) return '';
+  return a.slice(0, 6) + '…' + a.slice(-4);
 }
 
-function formatErr(e) {
-  if (!e) return "Unknown error";
-  const msg = e?.shortMessage || e?.message || String(e);
-  const code = e?.code ? ` | code=${e.code}` : "";
-  return `${msg}${code}`;
+function ipfsToHttp(url) {
+  if (!url) return '';
+  if (url.startsWith('ipfs://')) {
+    const cid = url.replace('ipfs://', '');
+    return `https://ipfs.io/ipfs/${cid}`;
+  }
+  return url;
 }
 
-function toHexChainId(dec) {
-  // 8453 => 0x2105
-  return "0x" + Number(dec).toString(16);
+function calcScore(attemptsUsed) {
+  // У тебя на скрине: попыток 5/7 => score 3
+  // 8 - 5 = 3
+  return Math.max(1, 8 - attemptsUsed);
 }
 
-// =======================
-// Page
-// =======================
+function clampInt(n, min, max) {
+  return Math.max(min, Math.min(max, n));
+}
+
 export default function Page() {
-  // Wallet
-  const [addr, setAddr] = useState("");
-  const [chainId, setChainId] = useState(null);
+  // providers
+  const readProvider = useMemo(() => new ethers.JsonRpcProvider(READ_RPC_URL, { chainId: CHAIN_ID, name: 'base' }), []);
+  const l2ResolverRead = useMemo(() => new ethers.Contract(BASENAME_L2_RESOLVER_ADDRESS, L2_RESOLVER_ABI, readProvider), [readProvider]);
 
-  // Game
-  const [secretK, setSecretK] = useState(() => randomInt(60, 120));
-  const [guess, setGuess] = useState("");
-  const [hint, setHint] = useState("-");
-  const [tries, setTries] = useState(0);
-  const [rounds, setRounds] = useState(1);
+  // wallet state
+  const [address, setAddress] = useState('');
+  const [chainId, setChainId] = useState(CHAIN_ID);
+
+  // basename state
+  const [basename, setBasename] = useState('');
+  const [avatarUrl, setAvatarUrl] = useState('');
+  const [nameStatus, setNameStatus] = useState('');
+
+  // game state
+  const [secret, setSecret] = useState(() => 60 + Math.floor(Math.random() * 61)); // 60..120
+  const [guess, setGuess] = useState('');
+  const [hint, setHint] = useState('-');
+  const [attempts, setAttempts] = useState(0);
   const [wins, setWins] = useState(0);
+  const [rounds, setRounds] = useState(1);
 
-  // Last win
-  const [lastWinGuess, setLastWinGuess] = useState(null);
-  const [lastWinScore, setLastWinScore] = useState(null);
-  const [savedTx, setSavedTx] = useState("-");
+  // scoring state
+  const [lastWin, setLastWin] = useState(null); // { guessK, score }
+  const [bestScore, setBestScore] = useState(0);
+  const [totalScore, setTotalScore] = useState(0);
 
-  // Status
-  const [diag, setDiag] = useState("");
-  const [err, setErr] = useState("");
+  // tx/diagnostics
+  const [diag, setDiag] = useState('');
+  const [err, setErr] = useState('');
+  const [savedTx, setSavedTx] = useState('');
 
-  const attemptsMax = 7;
-  const connected = !!addr;
+  // leaderboard
+  const [leaderboard, setLeaderboard] = useState([]);
+  const [lbStatus, setLbStatus] = useState('');
 
-  const lastWinBlock = useMemo(() => {
-    const g = lastWinGuess == null ? "-" : `${lastWinGuess}k`;
-    const s = lastWinScore == null ? "-" : `${lastWinScore}`;
-    return { g, s };
-  }, [lastWinGuess, lastWinScore]);
+  // выбранный метод записи (play/save/record/submit)
+  const [writeMethod, setWriteMethod] = useState('');
 
-  // Base App mini-app ready (не ломаем)
+  // === LOAD/STORE localStorage (чтобы не терялось) ===
   useEffect(() => {
     try {
-      if (typeof window !== "undefined" && window?.sdk?.actions?.ready) {
-        window.sdk.actions.ready();
-      }
+      const raw = localStorage.getItem('baseup_state_v1');
+      if (!raw) return;
+      const s = JSON.parse(raw);
+      if (typeof s.secret === 'number') setSecret(s.secret);
+      if (typeof s.attempts === 'number') setAttempts(s.attempts);
+      if (typeof s.wins === 'number') setWins(s.wins);
+      if (typeof s.rounds === 'number') setRounds(s.rounds);
+      if (typeof s.bestScore === 'number') setBestScore(s.bestScore);
+      if (typeof s.totalScore === 'number') setTotalScore(s.totalScore);
+      if (s.lastWin) setLastWin(s.lastWin);
     } catch {}
   }, []);
 
-  // подписки на смену аккаунта/сети
   useEffect(() => {
-    if (typeof window === "undefined" || !window.ethereum) return;
+    try {
+      localStorage.setItem(
+        'baseup_state_v1',
+        JSON.stringify({ secret, attempts, wins, rounds, bestScore, totalScore, lastWin })
+      );
+    } catch {}
+  }, [secret, attempts, wins, rounds, bestScore, totalScore, lastWin]);
 
-    const onAccountsChanged = (accounts) => {
-      const a = accounts?.[0] || "";
-      setAddr(a);
-      setSavedTx("-");
-      setErr("");
-      setDiag("");
-    };
+  // === Wallet connect (лениво, без лишних кнопок) ===
+  useEffect(() => {
+    (async () => {
+      try {
+        if (typeof window === 'undefined') return;
+        if (!window.ethereum) return;
 
-    const onChainChanged = (hex) => {
-      const id = parseInt(hex, 16);
-      setChainId(id);
-      setSavedTx("-");
-      setErr("");
-      setDiag("");
-    };
+        const bp = new ethers.BrowserProvider(window.ethereum);
+        const net = await bp.getNetwork();
+        setChainId(Number(net.chainId));
 
-    window.ethereum.on?.("accountsChanged", onAccountsChanged);
-    window.ethereum.on?.("chainChanged", onChainChanged);
+        const accs = await bp.listAccounts();
+        if (accs && accs.length) {
+          const a = await bp.getSigner().then((s) => s.getAddress());
+          setAddress(a);
+        }
 
-    return () => {
-      window.ethereum.removeListener?.("accountsChanged", onAccountsChanged);
-      window.ethereum.removeListener?.("chainChanged", onChainChanged);
-    };
+        // подписки
+        window.ethereum.on?.('accountsChanged', (accs2) => {
+          const a2 = (accs2 && accs2[0]) ? accs2[0] : '';
+          setAddress(a2);
+          setBasename('');
+          setAvatarUrl('');
+        });
+        window.ethereum.on?.('chainChanged', (hex) => {
+          const id = parseInt(hex, 16);
+          setChainId(id);
+        });
+      } catch {}
+    })();
   }, []);
 
-  // =======================
-  // Connect (только если не подключен)
-  // =======================
-  async function connectWallet() {
+  async function ensureWallet() {
+    setErr('');
+    setDiag('');
+    if (!window.ethereum) throw new Error('Нет wallet provider (window.ethereum). Открой в Base App / кошельке.');
+    const bp = new ethers.BrowserProvider(window.ethereum);
+
+    // request accounts
+    await bp.send('eth_requestAccounts', []);
+    const signer = await bp.getSigner();
+    const a = await signer.getAddress();
+    setAddress(a);
+
+    // chain check
+    const net = await bp.getNetwork();
+    const cid = Number(net.chainId);
+    setChainId(cid);
+
+    if (cid !== CHAIN_ID) {
+      // попросим переключиться
+      try {
+        await window.ethereum.request({
+          method: 'wallet_switchEthereumChain',
+          params: [{ chainId: '0x2105' }], // 8453
+        });
+        setChainId(CHAIN_ID);
+      } catch (e) {
+        throw new Error('Переключи сеть на Base (8453), потом снова жми Save onchain.');
+      }
+    }
+
+    return signer;
+  }
+
+  // === Basename resolve (БЕЗ resolver(bytes32)) ===
+  async function refreshBasename() {
+    setErr('');
+    setNameStatus('Обновляю имя...');
+    setBasename('');
+    setAvatarUrl('');
+
     try {
-      setErr("");
-      setDiag("");
+      if (!address) {
+        setNameStatus('Подключи кошелёк (нажми Save onchain — он сам запросит подключение).');
+        return;
+      }
 
-      if (!window.ethereum) throw new Error("Wallet не найден (нет window.ethereum)");
+      // стандартный ENS reverse: <addr>.addr.reverse
+      const reverseName = `${address.slice(2).toLowerCase()}.addr.reverse`;
+      const reverseNode = ethers.namehash(reverseName);
 
-      const accounts = await window.ethereum.request({ method: "eth_requestAccounts" });
-      const a = accounts?.[0];
-      if (!a) throw new Error("Кошелёк не вернул аккаунт");
+      const name = await l2ResolverRead.name(reverseNode);
+      if (!name) {
+        setBasename('');
+        setAvatarUrl('');
+        setNameStatus('Base Name не найден (reverse/primary record не выставлен).');
+        return;
+      }
 
-      setAddr(a);
+      setBasename(name);
 
-      const hex = await window.ethereum.request({ method: "eth_chainId" });
-      const id = parseInt(hex, 16);
-      setChainId(id);
+      // avatar через text record "avatar"
+      try {
+        const node = ethers.namehash(name);
+        const avatar = await l2ResolverRead.text(node, 'avatar');
+        const httpAvatar = ipfsToHttp(avatar);
+        if (httpAvatar) setAvatarUrl(httpAvatar);
+      } catch {}
 
-      setDiag(`Подключено: ${shortAddr(a)} | chainId=${id}`);
+      setNameStatus('Ок.');
     } catch (e) {
-      setErr(formatErr(e));
+      setNameStatus('');
+      setErr(`Имя/аватар: ${e?.message || String(e)}`);
     }
   }
 
-  // =======================
-  // Game
-  // =======================
+  // === ИГРА ===
   function newRound() {
-    setErr("");
-    setDiag("");
-    setHint("-");
-    setTries(0);
-    setGuess("");
-    setSecretK(randomInt(60, 120));
+    setErr('');
+    setDiag('');
+    setSavedTx('');
+    setHint('-');
+    setAttempts(0);
+    setGuess('');
     setRounds((r) => r + 1);
+    setSecret(60 + Math.floor(Math.random() * 61));
   }
 
   function checkGuess() {
-    setErr("");
-    setDiag("");
+    setErr('');
+    setDiag('');
+    setSavedTx('');
 
-    const g = clampInt(guess, 60, 120);
-    if (g === null) {
-      setHint("Введи число 60…120");
+    const g = parseInt(guess, 10);
+    if (!Number.isFinite(g)) {
+      setHint('Введи число (2–3 цифры)');
       return;
     }
+    const gg = clampInt(g, 60, 120);
 
-    const nextTries = tries + 1;
-    setTries(nextTries);
+    const nextAttempts = attempts + 1;
+    setAttempts(nextAttempts);
 
-    if (g === secretK) {
-      const score = Math.max(1, attemptsMax + 1 - nextTries); // 7..1
-      setHint("✅ Угадал!");
+    if (gg === secret) {
+      setHint('✅ Угадал!');
+      const score = calcScore(nextAttempts);
+      const guessK = gg * 1000;
+
       setWins((w) => w + 1);
-      setLastWinGuess(g);
-      setLastWinScore(score);
-      setSavedTx("-");
+      setBestScore((b) => Math.max(b, score));
+      setTotalScore((t) => t + score);
+      setLastWin({ guessK, score });
+
       return;
     }
 
-    setHint(g < secretK ? "🔼 Больше" : "🔽 Меньше");
-
-    if (nextTries >= attemptsMax) {
-      setHint(`❌ Попытки закончились. Было: ${secretK}`);
+    if (nextAttempts >= 7) {
+      setHint(`❌ Не угадал. Было: ${secret}`);
+      return;
     }
+
+    setHint(gg < secret ? '⬆️ Больше' : '⬇️ Меньше');
   }
 
-  // =======================
-  // Save onchain — КЛЮЧЕВОЙ ФИКС
-  //  - НЕ ethers provider/signer
-  //  - только window.ethereum.request("eth_sendTransaction")
-  // =======================
+  // === Автовыбор метода записи (play/save/record/submit) ===
+  async function detectWriteMethod(signer) {
+    if (writeMethod) return writeMethod;
+
+    const from = await signer.getAddress();
+    const candidates = ['play', 'save', 'record', 'submit'];
+    const iface = new ethers.Interface(GAME_WRITE_ABI);
+
+    // пробуем eth_call на каждом селекторе
+    for (const fn of candidates) {
+      try {
+        const data = iface.encodeFunctionData(fn, [1, 1]); // тестовые аргументы
+        await readProvider.call({ to: CONTRACT_ADDRESS, from, data });
+        setWriteMethod(fn);
+        return fn;
+      } catch {
+        // не этот
+      }
+    }
+    throw new Error('Не нашёл метод записи в контракте (play/save/record/submit).');
+  }
+
+  // === SAVE ONCHAIN ===
   async function saveOnchain() {
+    setErr('');
+    setDiag('Диагностика: готовлю транзакцию...');
+    setSavedTx('');
+
     try {
-      setErr("");
-      setDiag("Готовлю транзакцию…");
-
-      if (!window.ethereum) throw new Error("Wallet не найден (нет window.ethereum)");
-      if (!addr) throw new Error("Сначала подключи кошелёк");
-      if (lastWinGuess == null || lastWinScore == null) throw new Error("Нет победы для сохранения (сначала выиграй раунд)");
-
-      // Проверяем сеть (без автопереключения — никаких лишних pop-up)
-      const hex = await window.ethereum.request({ method: "eth_chainId" });
-      const id = parseInt(hex, 16);
-      setChainId(id);
-
-      if (id !== BASE_CHAIN_ID) {
-        throw new Error(`Нужна сеть Base Mainnet (8453). Сейчас: ${id}. Переключи сеть в кошельке и повтори.`);
+      if (!lastWin) {
+        throw new Error('Сначала выиграй раунд (нужна “Последняя победа”).');
       }
 
-      // Кодируем calldata вручную
-      const iface = new ethers.Interface(ABI);
+      const signer = await ensureWallet();
 
-      const score = BigInt(lastWinScore);
-      const g = BigInt(lastWinGuess);
+      // метод
+      const fn = await detectWriteMethod(signer);
 
-      const a = SEND_SCORE_FIRST ? score : g;
-      const b = SEND_SCORE_FIRST ? g : score;
+      const contract = new ethers.Contract(CONTRACT_ADDRESS, GAME_WRITE_ABI, signer);
 
-      const data = iface.encodeFunctionData(WRITE_METHOD, [a, b]);
+      // важно: guessK и score
+      const tx = await contract[fn](lastWin.score, lastWin.guessK);
+      setSavedTx(tx.hash);
+      setDiag(`Диагностика: TX отправлена: ${tx.hash}`);
 
-      // Просим кошелек показать транзу
-      setDiag("Ожидай окно кошелька (подпись транзакции)…");
-
-      const txHash = await window.ethereum.request({
-        method: "eth_sendTransaction",
-        params: [
-          {
-            from: addr,
-            to: CONTRACT_ADDRESS,
-            data,
-            gas: GAS_HEX,
-            value: "0x0",
-            chainId: toHexChainId(BASE_CHAIN_ID),
-          },
-        ],
-      });
-
-      setSavedTx(txHash);
-      setDiag(`TX отправлена: ${txHash}`);
+      // обновим лидерборд
+      await fetchLeaderboard();
     } catch (e) {
-      setErr(formatErr(e));
-      setDiag("");
+      setDiag('');
+      setErr(e?.message || String(e));
     }
   }
 
-  return (
-    <div style={{ minHeight: "100vh", padding: 14, fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial" }}>
-      <div style={{ maxWidth: 520, margin: "0 auto" }}>
-        <h2 style={{ margin: "6px 0 10px" }}>BaseUp — Guess BTC (k)</h2>
+  // === LEADERBOARD (из логов) ===
+  async function fetchLeaderboard() {
+    setLbStatus('Обновляю лидерборд...');
+    try {
+      const latest = await readProvider.getBlockNumber();
+      const fromBlock = Math.max(0, latest - LOOKBACK_BLOCKS);
 
-        <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 12, marginBottom: 12 }}>
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
-            <div style={{ fontWeight: 800 }}>
-              {connected ? shortAddr(addr) : "Кошелёк не подключен"}
+      const topics = EVENT_SIGS.map((sig) => ethers.id(sig));
+
+      const logs = await readProvider.getLogs({
+        address: CONTRACT_ADDRESS,
+        fromBlock,
+        toBlock: 'latest',
+        topics: [topics],
+      });
+
+      // декодим одинаково (address,uint256,uint256,uint256)
+      const coder = ethers.AbiCoder.defaultAbiCoder();
+
+      const rows = logs
+        .slice(-300) // ограничим, чтобы UI не умирал
+        .map((l) => {
+          const decoded = coder.decode(['address', 'uint256', 'uint256', 'uint256'], l.data);
+          return {
+            user: decoded[0],
+            score: Number(decoded[1]),
+            guess: Number(decoded[2]),
+            ts: Number(decoded[3]),
+            tx: l.transactionHash,
+            block: Number(l.blockNumber),
+          };
+        })
+        .sort((a, b) => b.block - a.block);
+
+      // агрегируем топ-10 по суммарному score
+      const map = new Map();
+      for (const r of rows) {
+        const key = r.user.toLowerCase();
+        const prev = map.get(key) || { user: r.user, total: 0, best: 0, lastTx: r.tx };
+        prev.total += r.score;
+        prev.best = Math.max(prev.best, r.score);
+        prev.lastTx = r.tx;
+        map.set(key, prev);
+      }
+
+      const top = Array.from(map.values())
+        .sort((a, b) => b.total - a.total)
+        .slice(0, 10);
+
+      setLeaderboard(top);
+      setLbStatus(`Ок. Событий за lookback: ${logs.length}`);
+    } catch (e) {
+      setLeaderboard([]);
+      setLbStatus('');
+      setErr(`Лидерборд: ${e?.message || String(e)}`);
+    }
+  }
+
+  useEffect(() => {
+    // на старте подтянуть лидерборд
+    fetchLeaderboard().catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    // при смене адреса — обновить basename
+    if (address) refreshBasename().catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [address]);
+
+  return (
+    <main style={{ maxWidth: 820, margin: '0 auto', padding: 16, fontFamily: 'system-ui, -apple-system, Segoe UI, Roboto, Arial' }}>
+      <h1 style={{ fontSize: 28, marginBottom: 10 }}>BaseUp — Guess BTC (k)</h1>
+
+      <div style={{ border: '1px solid #e5e7eb', borderRadius: 14, padding: 14, marginBottom: 14 }}>
+        <div style={{ display: 'flex', gap: 12, alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap' }}>
+          <div>
+            <div style={{ fontSize: 18, fontWeight: 700 }}>{address ? shortAddr(address) : 'Кошелёк не подключен'}</div>
+            <div style={{ color: '#6b7280', marginTop: 4 }}>
+              ChainId: <b>{chainId}</b> <br />
+              Контракт: <b>{CONTRACT_ADDRESS}</b>
             </div>
 
-            {!connected && (
-              <button
-                onClick={connectWallet}
-                style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #bbb", background: "#fff", cursor: "pointer" }}
-              >
-                Подключить
-              </button>
-            )}
+            <div style={{ marginTop: 10 }}>
+              <div style={{ fontWeight: 700, color: '#111827' }}>Base Name:</div>
+              <div style={{ color: basename ? '#111827' : '#b91c1c', marginTop: 2 }}>
+                {basename ? basename : 'не найден (скорее всего не выставлен reverse/primary record).'}
+              </div>
+              {avatarUrl ? (
+                <div style={{ marginTop: 10, display: 'flex', alignItems: 'center', gap: 10 }}>
+                  <img src={avatarUrl} alt="avatar" width={44} height={44} style={{ borderRadius: 12, border: '1px solid #e5e7eb' }} />
+                  <span style={{ color: '#6b7280', fontSize: 13 }}>avatar (text record)</span>
+                </div>
+              ) : null}
+              <div style={{ marginTop: 8, color: '#6b7280', fontSize: 13 }}>{nameStatus}</div>
+            </div>
           </div>
 
-          <div style={{ marginTop: 8, fontSize: 14 }}>
-            <div>ChainId: <b>{chainId ?? "-"}</b></div>
-            <div>Контракт: <b>{CONTRACT_ADDRESS}</b></div>
-          </div>
-
-          <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 10 }}>
-            <button
-              onClick={newRound}
-              style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #bbb", background: "#fff", cursor: "pointer" }}
-            >
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+            <button onClick={refreshBasename} style={btnStyle}>
+              Обновить Base Name
+            </button>
+            <button onClick={newRound} style={btnStyle}>
               Новый раунд
             </button>
-
-            <button
-              onClick={saveOnchain}
-              style={{
-                flex: 1,
-                padding: "10px 12px",
-                borderRadius: 10,
-                border: "1px solid #bbb",
-                background: "#fff",
-                cursor: "pointer",
-                fontWeight: 800,
-              }}
-            >
+            <button onClick={saveOnchain} style={{ ...btnStyle, fontWeight: 800 }}>
               Сохранить результат (onchain)
             </button>
           </div>
         </div>
+      </div>
 
-        <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 12, marginBottom: 12 }}>
-          <div style={{ fontWeight: 800, marginBottom: 10 }}>Угадай уровень BTC (k): введи 60…120</div>
+      <div style={{ border: '1px solid #e5e7eb', borderRadius: 14, padding: 14, marginBottom: 14 }}>
+        <h2 style={{ fontSize: 18, margin: 0, marginBottom: 10 }}>Угадай уровень BTC (k): введи 60…120</h2>
 
-          <div style={{ display: "flex", gap: 10 }}>
-            <input
-              value={guess}
-              onChange={(e) => setGuess(e.target.value)}
-              placeholder="например 69"
-              inputMode="numeric"
-              style={{ flex: 1, padding: 12, borderRadius: 10, border: "1px solid #bbb" }}
-            />
-            <button
-              onClick={checkGuess}
-              style={{ padding: "12px 14px", borderRadius: 10, border: "1px solid #bbb", background: "#fff", cursor: "pointer" }}
-            >
-              Проверить
+        <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+          <input
+            value={guess}
+            onChange={(e) => setGuess(e.target.value)}
+            placeholder="например 69"
+            inputMode="numeric"
+            style={{
+              padding: '10px 12px',
+              borderRadius: 12,
+              border: '1px solid #e5e7eb',
+              fontSize: 16,
+              width: 180,
+            }}
+          />
+          <button onClick={checkGuess} style={btnStyle}>
+            Проверить
+          </button>
+          <div style={{ color: '#6b7280' }}>Введите число (2–3 цифры)</div>
+        </div>
+
+        <div style={{ marginTop: 12, fontSize: 18 }}>
+          <b>Подсказка:</b> {hint}
+        </div>
+
+        <div style={{ marginTop: 10, color: '#111827' }}>
+          Попыток (в этом раунде): <b>{attempts}</b> / 7 <br />
+          Раунды: <b>{rounds}</b> <br />
+          Победы: <b>{wins}</b> <br />
+          Лучший результат за раунд: <b>{bestScore}</b> <br />
+          Суммарные очки (total): <b>{totalScore}</b>
+        </div>
+
+        <div style={{ marginTop: 12, padding: 12, borderRadius: 14, background: '#f9fafb', border: '1px solid #e5e7eb' }}>
+          <b>Последняя победа (для onchain):</b>
+          <div style={{ marginTop: 6, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace' }}>
+            guess: <b>{lastWin ? `${Math.floor(lastWin.guessK / 1000)}k` : '-'}</b> <br />
+            score: <b>{lastWin ? lastWin.score : '-'}</b> <br />
+            saved tx: <b>{savedTx ? savedTx : '-'}</b>
+          </div>
+        </div>
+
+        {diag ? <div style={{ marginTop: 12, color: '#047857', fontWeight: 700 }}>{diag}</div> : null}
+        {err ? <div style={{ marginTop: 12, color: '#b91c1c', fontWeight: 800 }}>Ошибка: {err}</div> : null}
+      </div>
+
+      <div style={{ border: '1px solid #e5e7eb', borderRadius: 14, padding: 14 }}>
+        <div style={{ display: 'flex', gap: 10, alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap' }}>
+          <h2 style={{ fontSize: 18, margin: 0 }}>Leaderboard (top-10, sum score)</h2>
+          <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+            <button onClick={fetchLeaderboard} style={btnStyle}>
+              Обновить лидерборд
             </button>
+            <span style={{ color: '#6b7280', fontSize: 13 }}>{lbStatus}</span>
           </div>
+        </div>
 
-          <div style={{ marginTop: 8, opacity: 0.75 }}>Введите число (2–3 цифры)</div>
+        <div style={{ marginTop: 12, overflowX: 'auto' }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 520 }}>
+            <thead>
+              <tr>
+                <th style={th}>#</th>
+                <th style={th}>Address</th>
+                <th style={th}>Total</th>
+                <th style={th}>Best</th>
+                <th style={th}>Last Tx</th>
+              </tr>
+            </thead>
+            <tbody>
+              {leaderboard.length === 0 ? (
+                <tr>
+                  <td colSpan={5} style={{ padding: 12, color: '#6b7280' }}>
+                    Нет данных (или событий нет в lookback).
+                  </td>
+                </tr>
+              ) : (
+                leaderboard.map((r, i) => (
+                  <tr key={r.user}>
+                    <td style={td}>{i + 1}</td>
+                    <td style={td}>{shortAddr(r.user)}</td>
+                    <td style={td}>{r.total}</td>
+                    <td style={td}>{r.best}</td>
+                    <td style={{ ...td, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace', fontSize: 12 }}>
+                      {r.lastTx ? shortAddr(r.lastTx) : '-'}
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
 
-          <div style={{ marginTop: 10, fontWeight: 700 }}>
-            Подсказка: <span style={{ fontWeight: 900 }}>{hint}</span>
-          </div>
-
-          <div style={{ marginTop: 10, lineHeight: 1.5 }}>
-            <div>Попыток (в этом раунде): <b>{Math.min(tries, attemptsMax)}</b> / <b>{attemptsMax}</b></div>
-            <div>Раунды: <b>{rounds}</b></div>
-            <div>Победы: <b>{wins}</b></div>
-          </div>
-
-          <div style={{ marginTop: 12, padding: 12, border: "1px solid #eee", borderRadius: 12, background: "#fafafa" }}>
-            <div style={{ fontWeight: 800, marginBottom: 6 }}>Последняя победа (для onchain):</div>
-            <div>guess: <b>{lastWinBlock.g}</b></div>
-            <div>score: <b>{lastWinBlock.s}</b></div>
-            <div>saved tx: <b>{savedTx}</b></div>
-          </div>
-
-          {diag ? <div style={{ marginTop: 12, color: "#0a7a2f", fontWeight: 800 }}>Диагностика: {diag}</div> : null}
-          {err ? <div style={{ marginTop: 12, color: "#b00000", fontWeight: 800 }}>Ошибка: {err}</div> : null}
+        <div style={{ marginTop: 10, color: '#6b7280', fontSize: 12 }}>
+          Примечание: лидерборд берётся из событий контракта за последние {LOOKBACK_BLOCKS.toLocaleString()} блоков (чтобы не упираться в лимиты RPC).
         </div>
       </div>
-    </div>
+    </main>
   );
 }
+
+const btnStyle = {
+  padding: '10px 12px',
+  borderRadius: 12,
+  border: '1px solid #e5e7eb',
+  background: 'white',
+  cursor: 'pointer',
+};
+
+const th = {
+  textAlign: 'left',
+  padding: '10px 8px',
+  borderBottom: '1px solid #e5e7eb',
+  color: '#374151',
+  fontSize: 13,
+};
+
+const td = {
+  padding: '10px 8px',
+  borderBottom: '1px solid #f3f4f6',
+  fontSize: 14,
+};
