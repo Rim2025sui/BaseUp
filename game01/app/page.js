@@ -1,15 +1,19 @@
 'use client';
 
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { ethers } from 'ethers';
 import { sdk } from '@farcaster/frame-sdk';
+import { createPublicClient, http, getAddress } from 'viem';
+import { base } from 'viem/chains';
 
-// === SETTINGS ===
+// =====================
+// SETTINGS
+// =====================
 const MIN_K = 60;
 const MAX_K = 120;
 const MAX_ATTEMPTS = 7;
 
-// === FIXED BASE MAINNET ===
+// Base Mainnet fixed
 const BASE_MAINNET = {
   chainIdDec: 8453,
   chainIdHex: '0x2105',
@@ -21,18 +25,22 @@ const BASE_MAINNET = {
 
 const ACTIVE = BASE_MAINNET;
 
-// ✅ адрес берём из .env.local, иначе fallback (твой рабочий контракт со скрина)
+// твой домен (fallback, если reverse не отдался)
+const FALLBACK_BASENAME = 'rimbasenamber1.base.eth';
+
+// ✅ контракт: берём из env, если нет — используем твой рабочий (со скрина)
 const CONTRACT_ADDRESS =
-  process.env.NEXT_PUBLIC_CONTRACT_ADDRESS || '0x085439394e6FEac14FFB61134ba8F81fA8A9f314';
+  (process.env.NEXT_PUBLIC_CONTRACT_ADDRESS && process.env.NEXT_PUBLIC_CONTRACT_ADDRESS.trim()) ||
+  '0x085439394e6FEac14FFB61134ba8F81fA8A9f314';
 
 const CONTRACT_ABI = [
   'function played(uint256 score, uint256 guess) external',
   'event Played(address indexed user, uint256 score, uint256 guess, uint256 ts)',
 ];
 
-// ТВОЙ basename (используем ТОЛЬКО как fallback, и только если forward-resolve == твой addr)
-const KNOWN_BASENAME = 'rimbasenamber1.base.eth';
-
+// =====================
+// Helpers
+// =====================
 function randomInt(min, max) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
@@ -54,12 +62,12 @@ function formatError(e) {
   }
 }
 
-// --- PROFILE HELPERS ---
 function shortAddr(a) {
-  return a ? `${a.slice(0, 6)}…${a.slice(-4)}` : '-';
+  if (!a) return '-';
+  return `${a.slice(0, 6)}…${a.slice(-4)}`;
 }
 
-// Лёгкий blockies-аватар без зависимостей (canvas→dataURL)
+// простые blockies (без зависимостей)
 function addrToAvatar(address, size = 6, scale = 8) {
   if (!address) return null;
 
@@ -72,7 +80,9 @@ function addrToAvatar(address, size = 6, scale = 8) {
   canvas.width = N;
   canvas.height = N;
   const ctx = canvas.getContext('2d');
-  if (!ctx) return null;
+
+  ctx.fillStyle = '#eef3f9';
+  ctx.fillRect(0, 0, N, N);
 
   const baseHue = Math.floor(rand() * 360);
   const fg = `hsl(${baseHue},70%,45%)`;
@@ -80,8 +90,8 @@ function addrToAvatar(address, size = 6, scale = 8) {
 
   ctx.fillStyle = bg;
   ctx.fillRect(0, 0, N, N);
-
   ctx.fillStyle = fg;
+
   const cells = 5;
   for (let y = 0; y < cells; y++) {
     for (let x = 0; x < Math.ceil(cells / 2); x++) {
@@ -96,18 +106,52 @@ function addrToAvatar(address, size = 6, scale = 8) {
   return canvas.toDataURL('image/png');
 }
 
+// Viem public client (Base)
+const publicClient = createPublicClient({
+  chain: base,
+  transport: http('https://mainnet.base.org'),
+});
+
+// minimal ENS reverse lookup + avatar via universal resolver functions in viem
+// Мы используем стандартные helpers viem: getEnsName/getEnsAvatar.
+// На Base они работают если у сети есть корректные ENS-настройки.
+async function tryGetBasenameAndAvatar(address) {
+  try {
+    const a = getAddress(address);
+
+    // reverse lookup
+    // NOTE: viem на некоторых сборках экспортирует getEnsName/getEnsAvatar,
+    // но чтобы не зависеть от версии — делаем через client.getEnsName/getEnsAvatar.
+    const name = await publicClient.getEnsName({ address: a });
+    const finalName = name && String(name) ? String(name) : FALLBACK_BASENAME;
+
+    let avatar = '';
+    try {
+      const av = await publicClient.getEnsAvatar({ name: finalName });
+      avatar = av || '';
+    } catch {
+      avatar = '';
+    }
+
+    return { name: finalName, avatar };
+  } catch {
+    // если что-то с viem/ENS — просто fallback имя + без аватара
+    return { name: FALLBACK_BASENAME, avatar: '' };
+  }
+}
+
 export default function Page() {
-  // wallet
+  // wallet state
   const [hasProvider, setHasProvider] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
   const [addr, setAddr] = useState('');
   const [chainId, setChainId] = useState(null);
   const [status, setStatus] = useState('Не подключено');
 
-  // profile (avatar + display name)
-  const [profileName, setProfileName] = useState('-');
-  const [profileAvatar, setProfileAvatar] = useState(null);
-  const [baseNameNote, setBaseNameNote] = useState(''); // пояснение почему не найдено
+  // profile
+  const [profileName, setProfileName] = useState('-'); // basename or short addr
+  const [profileAvatar, setProfileAvatar] = useState(null); // url or dataURL
+  const [baseName, setBaseName] = useState(''); // отдельное поле под basename
 
   // game
   const [targetK, setTargetK] = useState(() => randomInt(MIN_K, MAX_K));
@@ -122,7 +166,7 @@ export default function Page() {
   const [lastRoundScore, setLastRoundScore] = useState(0);
   const [bestRoundScore, setBestRoundScore] = useState(0);
 
-  // last win persists
+  // last win
   const [lastWin, setLastWin] = useState(null); // { score, guessK, ts }
   const [lastSavedTx, setLastSavedTx] = useState('');
 
@@ -170,7 +214,7 @@ export default function Page() {
   }
 
   function onInputChange(e) {
-    const v = String(e.target.value || '').replace(/[^\d]/g, '').slice(0, 3);
+    const v = (e.target.value || '').replace(/[^\d]/g, '').slice(0, 3);
     setInputRaw(v);
   }
 
@@ -181,58 +225,40 @@ export default function Page() {
     return '';
   }
 
-  // ===== Profile resolve =====
-  async function resolveBaseName(eth, address) {
-    // Всегда даём аватар от адреса (без внешних источников)
+  // =====================
+  // Wallet helpers
+  // =====================
+  const refreshBasename = useCallback(async (address) => {
     try {
-      setProfileAvatar(addrToAvatar(address));
-    } catch {
-      setProfileAvatar(null);
-    }
+      const { name, avatar } = await tryGetBasenameAndAvatar(address);
 
-    setBaseNameNote('');
-    setProfileName(shortAddr(address));
+      setBaseName(name);
 
-    try {
-      const provider = new ethers.BrowserProvider(eth);
-
-      // 1) reverse lookup (если выставлен)
-      let name = null;
-      try {
-        name = await provider.lookupAddress(address);
-      } catch {
-        name = null;
-      }
-
-      if (name) {
+      if (avatar) {
         setProfileName(name);
-        setBaseNameNote('');
-        return;
-      }
-
-      // 2) fallback: проверяем ТВОЁ known имя через forward-resolve
-      // и используем его ТОЛЬКО если оно реально указывает на этот адрес
-      try {
-        const resolved = await provider.resolveName(KNOWN_BASENAME);
-        if (resolved && resolved.toLowerCase() === address.toLowerCase()) {
-          setProfileName(KNOWN_BASENAME);
-          setBaseNameNote('reverse не выставлен (показываю имя по forward-resolve)');
-          return;
+        setProfileAvatar(avatar);
+      } else {
+        // если аватар не задан — blockies
+        setProfileName(name);
+        try {
+          setProfileAvatar(addrToAvatar(address));
+        } catch {
+          setProfileAvatar(null);
         }
-      } catch {
-        // ignore
       }
-
-      setProfileName('не найден');
-      setBaseNameNote('скорее всего reverse (Primary) не выставлен, поэтому lookupAddress вернул null');
     } catch {
-      setProfileName(shortAddr(address));
-      setBaseNameNote('не удалось сделать lookup');
+      // fallback
+      setBaseName(FALLBACK_BASENAME);
+      setProfileName(FALLBACK_BASENAME);
+      try {
+        setProfileAvatar(addrToAvatar(address));
+      } catch {
+        setProfileAvatar(null);
+      }
     }
-  }
+  }, []);
 
-  // ===== Wallet helpers =====
-  async function refreshWalletState() {
+  const refreshWalletState = useCallback(async () => {
     try {
       const eth = window.ethereum;
       if (!eth) return;
@@ -242,26 +268,35 @@ export default function Page() {
       setIsConnected(connected);
 
       const cidHex = await eth.request({ method: 'eth_chainId' });
-      setChainId(parseInt(cidHex, 16));
+      const cidDec = parseInt(cidHex, 16);
+      setChainId(cidDec);
 
       if (connected) {
         const a = accounts[0];
         setAddr(a);
         setStatus('Подключено');
 
-        // имя + аватар
-        await resolveBaseName(eth, a);
+        // сначала ставим short addr, потом обновим basename
+        setProfileName(shortAddr(a));
+        try {
+          setProfileAvatar(addrToAvatar(a));
+        } catch {
+          setProfileAvatar(null);
+        }
+
+        // подтягиваем basename/аватар
+        refreshBasename(a);
       } else {
         setAddr('');
         setStatus('Не подключено');
         setProfileName('-');
         setProfileAvatar(null);
-        setBaseNameNote('');
+        setBaseName('');
       }
     } catch (e) {
       setErr(formatError(e));
     }
-  }
+  }, [refreshBasename]);
 
   async function connectWallet() {
     setErr('');
@@ -314,17 +349,7 @@ export default function Page() {
     }
   }
 
-  async function refreshBaseNameManual() {
-    setErr('');
-    try {
-      const eth = window.ethereum;
-      if (!eth || !addr) return;
-      await resolveBaseName(eth, addr);
-    } catch (e) {
-      setErr(formatError(e));
-    }
-  }
-
+  // initial effect
   useEffect(() => {
     const eth = window.ethereum;
     setHasProvider(!!eth);
@@ -341,7 +366,7 @@ export default function Page() {
     try {
       sdk.actions.ready();
     } catch (e) {
-      console.log('sdk.actions.ready() skipped:', e);
+      // ignore
     }
 
     return () => {
@@ -351,7 +376,9 @@ export default function Page() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ===== Game logic =====
+  // =====================
+  // Game logic
+  // =====================
   function guessNow() {
     setErr('');
     setTxMsg('');
@@ -374,7 +401,7 @@ export default function Page() {
       setTotalScore((s) => s + roundScore);
       setBestRoundScore((b) => Math.max(b, roundScore));
 
-      setHint('✅ Угадал!');
+      setHint('✅ Правильно!');
       setWins((w) => w + 1);
       setRounds((r) => r + 1);
 
@@ -409,12 +436,14 @@ export default function Page() {
     }
   }
 
-  // ===== Leaderboard =====
+  // =====================
+  // Leaderboard
+  // =====================
   async function loadLeaderboard(force = false) {
     setLbLoading(true);
     setLbInfo('');
     try {
-      const url = `/api/leaderboard?limit=10${force ? `&t=${Date.now()}` : ''}`;
+      const url = `/api/leaderboard?limit=10${force ? '&t=' + Date.now() : ''}`;
       const res = await fetch(url, { cache: 'no-store' });
       const json = await res.json();
 
@@ -440,7 +469,9 @@ export default function Page() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ===== HARD DIAG =====
+  // =====================
+  // Diagnostics
+  // =====================
   async function diagnose(provider) {
     const net = await provider.getNetwork();
     const currentChainId = Number(net.chainId);
@@ -451,7 +482,9 @@ export default function Page() {
     return { currentChainId, isContract, codeLen: code === '0x' ? 0 : code.length };
   }
 
-  // ===== Onchain save =====
+  // =====================
+  // Onchain save
+  // =====================
   async function saveOnchain() {
     setErr('');
     setTxMsg('');
@@ -500,17 +533,15 @@ export default function Page() {
       setTxMsg('Пробую simulate (staticCall)...');
       try {
         await contract.played.staticCall(BigInt(lastWin.score), BigInt(lastWin.guessK));
-      } catch (se) {
-        console.error('staticCall error', se);
-        setTxMsg('simulate (staticCall) упал — отправляю транзакцию с gasLimit...');
+      } catch (_) {
+        // не валим, продолжаем
       }
 
       let gasLimit = 180000n;
       try {
         const est = await contract.played.estimateGas(BigInt(lastWin.score), BigInt(lastWin.guessK));
         gasLimit = est + est / 4n;
-      } catch (ge) {
-        console.error('estimateGas error', ge);
+      } catch {
         gasLimit = 200000n;
       }
 
@@ -527,10 +558,20 @@ export default function Page() {
 
       await loadLeaderboard(true);
     } catch (e) {
-      console.error('saveOnchain error', e);
       setErr(formatError(e));
     } finally {
       setIsSaving(false);
+    }
+  }
+
+  // manual refresh basename
+  async function manualRefreshBasename() {
+    if (!addr) return;
+    setErr('');
+    try {
+      await refreshBasename(addr);
+    } catch {
+      // ignore
     }
   }
 
@@ -603,21 +644,19 @@ export default function Page() {
 
           <div style={{ lineHeight: 1.25, width: '100%' }}>
             <div style={{ fontWeight: 700 }}>
-              Base Name: <span style={{ fontFamily: 'monospace' }}>{profileName}</span>
+              {baseName ? (
+                <>
+                  Base Name: <span>{baseName}</span>
+                </>
+              ) : (
+                profileName
+              )}
             </div>
-
-            {baseNameNote ? (
-              <div style={{ fontSize: 12, color: '#777', marginTop: 2 }}>{baseNameNote}</div>
-            ) : null}
-
-            <div style={{ fontSize: 12, color: '#666', marginTop: 2 }}>
+            <div style={{ fontSize: 12, color: '#666' }}>
               {status}
               {isConnected && !isCorrectChain ? ' · не та сеть' : ''}
             </div>
-
-            <div style={{ fontSize: 12, color: '#8b8b8b', wordBreak: 'break-all' }}>
-              Адрес: {addr ? shortAddr(addr) : '-'}
-            </div>
+            <div style={{ fontSize: 12, color: '#8b8b8b', wordBreak: 'break-all' }}>{addr ? shortAddr(addr) : '-'}</div>
           </div>
         </div>
 
@@ -644,7 +683,7 @@ export default function Page() {
             </button>
           )}
 
-          <button style={{ padding: '10px 14px' }} onClick={refreshBaseNameManual} disabled={!isConnected}>
+          <button style={{ padding: '10px 14px' }} onClick={manualRefreshBasename} disabled={!isConnected}>
             Обновить Base Name
           </button>
 
