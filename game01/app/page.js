@@ -4,35 +4,22 @@ import React, { useEffect, useMemo, useState } from "react";
 import { ethers } from "ethers";
 
 // =======================
-// НАСТРОЙКИ (1 место)
+// CONFIG
 // =======================
 const BASE_CHAIN_ID = 8453;
-const BASE_CHAIN_ID_HEX = "0x2105";
 const CONTRACT_ADDRESS = "0x622678862992c0A2414b536Bc4B8B391602BCf";
 
-// ВАЖНО: имя write-функции контракта (поменяешь ТОЛЬКО ЭТО, если у тебя другое имя)
-// Примеры: "play", "saveResult", "record", "save"
+// ВАЖНО: имя write-функции в контракте.
+// Если у тебя другое — поменяй ТОЛЬКО ЭТО на 1 слово.
 const WRITE_METHOD = "play";
 
-// ВАЖНО: порядок аргументов в write-функции
+// ВАЖНО: порядок аргументов в write-функции:
 // true  => (score, guess)
 // false => (guess, score)
 const SEND_SCORE_FIRST = true;
 
-// Минимальный ABI: event + write-функция
-// Если твой write метод другой, но с теми же 2 uint256 — просто меняешь WRITE_METHOD сверху.
+// Минимальный ABI: write функция (2x uint256). Событие не нужно для отправки tx.
 const ABI = [
-  {
-    anonymous: false,
-    inputs: [
-      { indexed: true, internalType: "address", name: "user", type: "address" },
-      { indexed: false, internalType: "uint256", name: "score", type: "uint256" },
-      { indexed: false, internalType: "uint256", name: "guess", type: "uint256" },
-      { indexed: false, internalType: "uint256", name: "ts", type: "uint256" },
-    ],
-    name: "GamePlayed",
-    type: "event",
-  },
   {
     inputs: [
       { internalType: "uint256", name: "a", type: "uint256" },
@@ -46,7 +33,7 @@ const ABI = [
 ];
 
 // =======================
-// Утилиты
+// Utils
 // =======================
 function clampInt(n, lo, hi) {
   const x = Number(n);
@@ -57,7 +44,6 @@ function clampInt(n, lo, hi) {
 }
 
 function randomInt(lo, hi) {
-  // inclusive
   return lo + Math.floor(Math.random() * (hi - lo + 1));
 }
 
@@ -67,31 +53,22 @@ function shortAddr(a) {
 }
 
 function formatEthersErr(e) {
+  // максимально информативно, но коротко
   const short = e?.shortMessage;
   const msg = e?.message;
   const code = e?.code ? ` | code=${e.code}` : "";
-  if (short) return `${short}${code}`;
-  if (msg) return `${msg}${code}`;
+  const reason = e?.reason ? ` | reason=${e.reason}` : "";
+  if (short) return `${short}${code}${reason}`;
+  if (msg) return `${msg}${code}${reason}`;
   return String(e);
 }
 
-// НЕ ДОЛЖНО ЛОМАТЬ ПРИЛОЖЕНИЕ (ENS может падать на Base)
-async function safeLookupBaseName(provider, address) {
-  try {
-    const name = await provider.lookupAddress(address);
-    return name || null;
-  } catch {
-    return null;
-  }
-}
-
 // =======================
-// UI
+// Page
 // =======================
 export default function Page() {
-  // Wallet / chain
+  // Wallet
   const [addr, setAddr] = useState("");
-  const [baseName, setBaseName] = useState(null);
   const [chainId, setChainId] = useState(null);
 
   // Game
@@ -102,12 +79,10 @@ export default function Page() {
   const [rounds, setRounds] = useState(1);
   const [wins, setWins] = useState(0);
 
-  // Scores
+  // Win info
   const [lastWinGuess, setLastWinGuess] = useState(null);
   const [lastWinScore, setLastWinScore] = useState(null);
   const [savedTx, setSavedTx] = useState("-");
-  const [bestRound, setBestRound] = useState(0);
-  const [totalPoints, setTotalPoints] = useState(0);
 
   // Status
   const [diag, setDiag] = useState("");
@@ -123,28 +98,22 @@ export default function Page() {
     return { g, s };
   }, [lastWinGuess, lastWinScore]);
 
-  // =======================
-  // Init: Base App ready (не ломаем, если SDK нет)
-  // =======================
+  // Base App mini-app ready (не ломаем если нет sdk)
   useEffect(() => {
     try {
-      // иногда в mini-app есть sdk в window
       if (typeof window !== "undefined" && window?.sdk?.actions?.ready) {
         window.sdk.actions.ready();
       }
     } catch {}
   }, []);
 
-  // =======================
-  // Подписки на смену аккаунта/сети
-  // =======================
+  // listen account/chain changes
   useEffect(() => {
     if (typeof window === "undefined" || !window.ethereum) return;
 
     const onAccountsChanged = (accounts) => {
       const a = accounts?.[0] || "";
       setAddr(a);
-      setBaseName(null);
       setSavedTx("-");
       setErr("");
       setDiag("");
@@ -153,7 +122,6 @@ export default function Page() {
     const onChainChanged = (hex) => {
       const id = parseInt(hex, 16);
       setChainId(id);
-      setBaseName(null);
       setSavedTx("-");
       setErr("");
       setDiag("");
@@ -168,9 +136,7 @@ export default function Page() {
     };
   }, []);
 
-  // =======================
-  // Connect
-  // =======================
+  // connect (одна кнопка, без "переподключить")
   async function connectWallet() {
     try {
       setErr("");
@@ -188,56 +154,13 @@ export default function Page() {
       const net = await bp.getNetwork();
       setChainId(Number(net.chainId));
 
-      // name pull не ломает app
-      const name = await safeLookupBaseName(bp, a);
-      setBaseName(name);
-
       setDiag(`Подключено: ${shortAddr(a)} | chainId=${Number(net.chainId)}`);
     } catch (e) {
       setErr(formatEthersErr(e));
     }
   }
 
-  async function switchToBase() {
-    try {
-      setErr("");
-      setDiag("");
-      if (!window.ethereum) throw new Error("Wallet не найден (нет window.ethereum)");
-
-      await window.ethereum.request({
-        method: "wallet_switchEthereumChain",
-        params: [{ chainId: BASE_CHAIN_ID_HEX }],
-      });
-
-      // chainChanged сам прилетит, но подстрахуем
-      const bp = new ethers.BrowserProvider(window.ethereum);
-      const net = await bp.getNetwork();
-      setChainId(Number(net.chainId));
-      setDiag(`Сеть переключена: chainId=${Number(net.chainId)}`);
-    } catch (e) {
-      setErr(formatEthersErr(e));
-    }
-  }
-
-  async function refreshBaseName() {
-    try {
-      setErr("");
-      setDiag("");
-      if (!window.ethereum) throw new Error("Wallet не найден (нет window.ethereum)");
-      if (!addr) throw new Error("Сначала подключи кошелёк");
-
-      const bp = new ethers.BrowserProvider(window.ethereum);
-      const name = await safeLookupBaseName(bp, addr);
-      setBaseName(name);
-      setDiag(name ? `Base Name обновлён: ${name}` : "Base Name не найден (скорее всего не выставлен reverse/primary record).");
-    } catch (e) {
-      setErr(formatEthersErr(e));
-    }
-  }
-
-  // =======================
-  // Game actions
-  // =======================
+  // game
   function newRound() {
     setErr("");
     setDiag("");
@@ -262,26 +185,16 @@ export default function Page() {
     setTries(nextTries);
 
     if (g === secretK) {
-      // очки за победу: чем меньше попыток — тем больше
-      // 1 попытка => 7 очков, 7 попыток => 1 очко
-      const score = Math.max(1, attemptsMax + 1 - nextTries);
-
+      const score = Math.max(1, attemptsMax + 1 - nextTries); // 7..1
       setHint("✅ Угадал!");
       setWins((w) => w + 1);
-
       setLastWinGuess(g);
       setLastWinScore(score);
       setSavedTx("-");
-
-      setBestRound((best) => Math.max(best, score));
-      setTotalPoints((t) => t + score);
-
-      // следующий раунд автоматически (как хочешь — я оставил “Новый раунд” кнопкой)
       return;
     }
 
-    if (g < secretK) setHint("🔼 Больше");
-    if (g > secretK) setHint("🔽 Меньше");
+    setHint(g < secretK ? "🔼 Больше" : "🔽 Меньше");
 
     if (nextTries >= attemptsMax) {
       setHint(`❌ Попытки закончились. Было: ${secretK}`);
@@ -289,35 +202,40 @@ export default function Page() {
   }
 
   // =======================
-  // Onchain save
+  // Save onchain (главный фикс)
+  // - НЕ используем contract.method() чтобы ethers не делал estimateGas, который у тебя ломается
+  // - отправляем RAW tx через signer.sendTransaction с gasLimit
   // =======================
   async function saveOnchain() {
     try {
       setErr("");
-      setDiag("Диагностика сети/контракта…");
+      setDiag("Готовлю транзакцию…");
 
       if (!window.ethereum) throw new Error("Wallet не найден (нет window.ethereum)");
       if (!addr) throw new Error("Сначала подключи кошелёк");
       if (lastWinGuess == null || lastWinScore == null) throw new Error("Нет победы для сохранения (сначала выиграй раунд)");
 
-      // BrowserProvider -> signer (иначе транзы не будет)
       const bp = new ethers.BrowserProvider(window.ethereum);
       await bp.send("eth_requestAccounts", []);
       const signer = await bp.getSigner();
 
+      // 1) Проверка сети (БЕЗ auto-switch, чтобы не было лишних pop-up)
       const net = await bp.getNetwork();
       const id = Number(net.chainId);
       setChainId(id);
 
       if (id !== BASE_CHAIN_ID) {
-        setDiag(`Нужно Base Mainnet (8453). Сейчас: ${id}. Переключаю…`);
-        await window.ethereum.request({
-          method: "wallet_switchEthereumChain",
-          params: [{ chainId: BASE_CHAIN_ID_HEX }],
-        });
+        throw new Error(`Нужна сеть Base Mainnet (8453). Сейчас: ${id}. Переключи сеть в кошельке и повтори.`);
       }
 
-      const contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, signer);
+      // 2) Проверка что по адресу реально контракт
+      const code = await bp.getCode(CONTRACT_ADDRESS);
+      if (!code || code === "0x") {
+        throw new Error("По адресу контракта нет bytecode (это не контракт). Проверь CONTRACT_ADDRESS.");
+      }
+
+      // 3) Кодируем data вручную (никакого estimateGas)
+      const iface = new ethers.Interface(ABI);
 
       const score = BigInt(lastWinScore);
       const g = BigInt(lastWinGuess);
@@ -325,24 +243,28 @@ export default function Page() {
       const a = SEND_SCORE_FIRST ? score : g;
       const b = SEND_SCORE_FIRST ? g : score;
 
-      setDiag("Готовлю транзакцию… Ожидай окно кошелька.");
-      const tx = await contract[WRITE_METHOD](a, b);
-      setDiag(`TX отправлена: ${tx.hash}`);
+      const data = iface.encodeFunctionData(WRITE_METHOD, [a, b]);
+
+      // 4) RAW sendTransaction с gasLimit => окно транзы обязано появиться
+      setDiag("Ожидай окно кошелька (подпись транзакции)…");
+      const tx = await signer.sendTransaction({
+        to: CONTRACT_ADDRESS,
+        data,
+        // фиксируем газ, чтобы НЕ дергать estimateGas (оно у тебя и ломается)
+        gasLimit: 150000n,
+      });
+
       setSavedTx(tx.hash);
+      setDiag(`TX отправлена: ${tx.hash}`);
 
       const rc = await tx.wait();
-      setDiag(`TX подтверждена: ${rc.hash}`);
       setSavedTx(rc.hash);
+      setDiag(`TX подтверждена: ${rc.hash}`);
     } catch (e) {
       setErr(formatEthersErr(e));
       setDiag("");
     }
   }
-
-  // =======================
-  // Render
-  // =======================
-  const baseNameText = baseName ? baseName : "не найден (скорее всего не выставлен reverse/primary record).";
 
   return (
     <div style={{ minHeight: "100vh", padding: 14, fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial" }}>
@@ -350,42 +272,24 @@ export default function Page() {
         <h2 style={{ margin: "6px 0 10px" }}>BaseUp — Guess BTC (k)</h2>
 
         <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 12, marginBottom: 12 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 10, justifyContent: "space-between", flexWrap: "wrap" }}>
-            <div style={{ fontWeight: 700 }}>{connected ? shortAddr(addr) : "Кошелёк не подключен"}</div>
-            <button
-              onClick={connectWallet}
-              style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #bbb", background: "#fff", cursor: "pointer" }}
-            >
-              {connected ? "Переподключить" : "Подключить"}
-            </button>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+            <div style={{ fontWeight: 800 }}>{connected ? shortAddr(addr) : "Кошелёк не подключен"}</div>
+            {!connected && (
+              <button
+                onClick={connectWallet}
+                style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #bbb", background: "#fff", cursor: "pointer" }}
+              >
+                Подключить
+              </button>
+            )}
           </div>
 
-          {connected && (
-            <div style={{ marginTop: 8, color: "#333" }}>
-              <div style={{ fontSize: 13, opacity: 0.9 }}>Подключено</div>
-              <div style={{ fontSize: 13, opacity: 0.9 }}>{addr}</div>
-
-              <div style={{ marginTop: 8, color: "#b00000" }}>
-                <div style={{ fontWeight: 700 }}>Base Name:</div>
-                <div>{baseNameText}</div>
-              </div>
-            </div>
-          )}
-        </div>
-
-        <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 12, marginBottom: 12 }}>
-          <div style={{ fontWeight: 700, marginBottom: 6 }}>Chain / Contract</div>
-          <div style={{ fontSize: 14 }}>ChainId: {chainId ?? "-"}</div>
-          <div style={{ fontSize: 14 }}>Контракт: {CONTRACT_ADDRESS}</div>
+          <div style={{ marginTop: 8, fontSize: 14 }}>
+            <div>ChainId: <b>{chainId ?? "-"}</b></div>
+            <div>Контракт: <b>{CONTRACT_ADDRESS}</b></div>
+          </div>
 
           <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 10 }}>
-            <button
-              onClick={refreshBaseName}
-              style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #bbb", background: "#fff", cursor: "pointer" }}
-            >
-              Обновить Base Name
-            </button>
-
             <button
               onClick={newRound}
               style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #bbb", background: "#fff", cursor: "pointer" }}
@@ -394,24 +298,15 @@ export default function Page() {
             </button>
 
             <button
-              onClick={switchToBase}
-              style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #bbb", background: "#fff", cursor: "pointer" }}
-            >
-              Переключить на Base
-            </button>
-          </div>
-
-          <div style={{ marginTop: 10 }}>
-            <button
               onClick={saveOnchain}
               style={{
-                width: "100%",
-                padding: "12px 12px",
+                flex: 1,
+                padding: "10px 12px",
                 borderRadius: 10,
                 border: "1px solid #bbb",
                 background: "#fff",
                 cursor: "pointer",
-                fontWeight: 700,
+                fontWeight: 800,
               }}
             >
               Сохранить результат (onchain)
@@ -440,15 +335,14 @@ export default function Page() {
 
           <div style={{ marginTop: 8, opacity: 0.75 }}>Введите число (2–3 цифры)</div>
 
-          <div style={{ marginTop: 10, fontWeight: 700 }}>Подсказка: <span style={{ fontWeight: 800 }}>{hint}</span></div>
+          <div style={{ marginTop: 10, fontWeight: 700 }}>
+            Подсказка: <span style={{ fontWeight: 900 }}>{hint}</span>
+          </div>
 
           <div style={{ marginTop: 10, lineHeight: 1.5 }}>
             <div>Попыток (в этом раунде): <b>{Math.min(tries, attemptsMax)}</b> / <b>{attemptsMax}</b></div>
             <div>Раунды: <b>{rounds}</b></div>
             <div>Победы: <b>{wins}</b></div>
-            <div>Очки за последнюю победу: <b>{lastWinScore ?? "-"}</b></div>
-            <div>Лучший результат за раунд: <b>{bestRound}</b></div>
-            <div>Суммарные очки (total): <b>{totalPoints}</b></div>
           </div>
 
           <div style={{ marginTop: 12, padding: 12, border: "1px solid #eee", borderRadius: 12, background: "#fafafa" }}>
@@ -458,13 +352,8 @@ export default function Page() {
             <div>saved tx: <b>{savedTx}</b></div>
           </div>
 
-          {diag ? (
-            <div style={{ marginTop: 12, color: "#0a7a2f", fontWeight: 700 }}>Диагностика: {diag}</div>
-          ) : null}
-
-          {err ? (
-            <div style={{ marginTop: 12, color: "#b00000", fontWeight: 700 }}>Ошибка: {err}</div>
-          ) : null}
+          {diag ? <div style={{ marginTop: 12, color: "#0a7a2f", fontWeight: 800 }}>Диагностика: {diag}</div> : null}
+          {err ? <div style={{ marginTop: 12, color: "#b00000", fontWeight: 800 }}>Ошибка: {err}</div> : null}
         </div>
       </div>
     </div>
