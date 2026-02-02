@@ -9,16 +9,16 @@ import { ethers } from "ethers";
 const BASE_CHAIN_ID = 8453;
 const CONTRACT_ADDRESS = "0x622678862992c0A2414b536Bc4B8B391602BCf";
 
-// ВАЖНО: имя write-функции в контракте.
-// Если у тебя другое — поменяй ТОЛЬКО ЭТО на 1 слово.
+// 1) Имя write-функции в контракте (если не "play" — поменяй ОДНО слово)
 const WRITE_METHOD = "play";
 
-// ВАЖНО: порядок аргументов в write-функции:
-// true  => (score, guess)
-// false => (guess, score)
+// 2) Порядок аргументов (у тебя событие было score, guess — поэтому true)
 const SEND_SCORE_FIRST = true;
 
-// Минимальный ABI: write функция (2x uint256). Событие не нужно для отправки tx.
+// 3) Газ фиксируем (чтобы кошелёк не делал estimateGas)
+const GAS_HEX = "0x249F0"; // 150000
+
+// ABI: только write-функция на 2 uint256
 const ABI = [
   {
     inputs: [
@@ -52,15 +52,16 @@ function shortAddr(a) {
   return a.slice(0, 6) + "…" + a.slice(-4);
 }
 
-function formatEthersErr(e) {
-  // максимально информативно, но коротко
-  const short = e?.shortMessage;
-  const msg = e?.message;
+function formatErr(e) {
+  if (!e) return "Unknown error";
+  const msg = e?.shortMessage || e?.message || String(e);
   const code = e?.code ? ` | code=${e.code}` : "";
-  const reason = e?.reason ? ` | reason=${e.reason}` : "";
-  if (short) return `${short}${code}${reason}`;
-  if (msg) return `${msg}${code}${reason}`;
-  return String(e);
+  return `${msg}${code}`;
+}
+
+function toHexChainId(dec) {
+  // 8453 => 0x2105
+  return "0x" + Number(dec).toString(16);
 }
 
 // =======================
@@ -79,7 +80,7 @@ export default function Page() {
   const [rounds, setRounds] = useState(1);
   const [wins, setWins] = useState(0);
 
-  // Win info
+  // Last win
   const [lastWinGuess, setLastWinGuess] = useState(null);
   const [lastWinScore, setLastWinScore] = useState(null);
   const [savedTx, setSavedTx] = useState("-");
@@ -89,7 +90,6 @@ export default function Page() {
   const [err, setErr] = useState("");
 
   const attemptsMax = 7;
-
   const connected = !!addr;
 
   const lastWinBlock = useMemo(() => {
@@ -98,7 +98,7 @@ export default function Page() {
     return { g, s };
   }, [lastWinGuess, lastWinScore]);
 
-  // Base App mini-app ready (не ломаем если нет sdk)
+  // Base App mini-app ready (не ломаем)
   useEffect(() => {
     try {
       if (typeof window !== "undefined" && window?.sdk?.actions?.ready) {
@@ -107,7 +107,7 @@ export default function Page() {
     } catch {}
   }, []);
 
-  // listen account/chain changes
+  // подписки на смену аккаунта/сети
   useEffect(() => {
     if (typeof window === "undefined" || !window.ethereum) return;
 
@@ -136,7 +136,9 @@ export default function Page() {
     };
   }, []);
 
-  // connect (одна кнопка, без "переподключить")
+  // =======================
+  // Connect (только если не подключен)
+  // =======================
   async function connectWallet() {
     try {
       setErr("");
@@ -144,23 +146,25 @@ export default function Page() {
 
       if (!window.ethereum) throw new Error("Wallet не найден (нет window.ethereum)");
 
-      const bp = new ethers.BrowserProvider(window.ethereum);
-      await bp.send("eth_requestAccounts", []);
+      const accounts = await window.ethereum.request({ method: "eth_requestAccounts" });
+      const a = accounts?.[0];
+      if (!a) throw new Error("Кошелёк не вернул аккаунт");
 
-      const signer = await bp.getSigner();
-      const a = await signer.getAddress();
       setAddr(a);
 
-      const net = await bp.getNetwork();
-      setChainId(Number(net.chainId));
+      const hex = await window.ethereum.request({ method: "eth_chainId" });
+      const id = parseInt(hex, 16);
+      setChainId(id);
 
-      setDiag(`Подключено: ${shortAddr(a)} | chainId=${Number(net.chainId)}`);
+      setDiag(`Подключено: ${shortAddr(a)} | chainId=${id}`);
     } catch (e) {
-      setErr(formatEthersErr(e));
+      setErr(formatErr(e));
     }
   }
 
-  // game
+  // =======================
+  // Game
+  // =======================
   function newRound() {
     setErr("");
     setDiag("");
@@ -202,9 +206,9 @@ export default function Page() {
   }
 
   // =======================
-  // Save onchain (главный фикс)
-  // - НЕ используем contract.method() чтобы ethers не делал estimateGas, который у тебя ломается
-  // - отправляем RAW tx через signer.sendTransaction с gasLimit
+  // Save onchain — КЛЮЧЕВОЙ ФИКС
+  //  - НЕ ethers provider/signer
+  //  - только window.ethereum.request("eth_sendTransaction")
   // =======================
   async function saveOnchain() {
     try {
@@ -215,26 +219,16 @@ export default function Page() {
       if (!addr) throw new Error("Сначала подключи кошелёк");
       if (lastWinGuess == null || lastWinScore == null) throw new Error("Нет победы для сохранения (сначала выиграй раунд)");
 
-      const bp = new ethers.BrowserProvider(window.ethereum);
-      await bp.send("eth_requestAccounts", []);
-      const signer = await bp.getSigner();
-
-      // 1) Проверка сети (БЕЗ auto-switch, чтобы не было лишних pop-up)
-      const net = await bp.getNetwork();
-      const id = Number(net.chainId);
+      // Проверяем сеть (без автопереключения — никаких лишних pop-up)
+      const hex = await window.ethereum.request({ method: "eth_chainId" });
+      const id = parseInt(hex, 16);
       setChainId(id);
 
       if (id !== BASE_CHAIN_ID) {
         throw new Error(`Нужна сеть Base Mainnet (8453). Сейчас: ${id}. Переключи сеть в кошельке и повтори.`);
       }
 
-      // 2) Проверка что по адресу реально контракт
-      const code = await bp.getCode(CONTRACT_ADDRESS);
-      if (!code || code === "0x") {
-        throw new Error("По адресу контракта нет bytecode (это не контракт). Проверь CONTRACT_ADDRESS.");
-      }
-
-      // 3) Кодируем data вручную (никакого estimateGas)
+      // Кодируем calldata вручную
       const iface = new ethers.Interface(ABI);
 
       const score = BigInt(lastWinScore);
@@ -245,23 +239,27 @@ export default function Page() {
 
       const data = iface.encodeFunctionData(WRITE_METHOD, [a, b]);
 
-      // 4) RAW sendTransaction с gasLimit => окно транзы обязано появиться
+      // Просим кошелек показать транзу
       setDiag("Ожидай окно кошелька (подпись транзакции)…");
-      const tx = await signer.sendTransaction({
-        to: CONTRACT_ADDRESS,
-        data,
-        // фиксируем газ, чтобы НЕ дергать estimateGas (оно у тебя и ломается)
-        gasLimit: 150000n,
+
+      const txHash = await window.ethereum.request({
+        method: "eth_sendTransaction",
+        params: [
+          {
+            from: addr,
+            to: CONTRACT_ADDRESS,
+            data,
+            gas: GAS_HEX,
+            value: "0x0",
+            chainId: toHexChainId(BASE_CHAIN_ID),
+          },
+        ],
       });
 
-      setSavedTx(tx.hash);
-      setDiag(`TX отправлена: ${tx.hash}`);
-
-      const rc = await tx.wait();
-      setSavedTx(rc.hash);
-      setDiag(`TX подтверждена: ${rc.hash}`);
+      setSavedTx(txHash);
+      setDiag(`TX отправлена: ${txHash}`);
     } catch (e) {
-      setErr(formatEthersErr(e));
+      setErr(formatErr(e));
       setDiag("");
     }
   }
@@ -273,7 +271,10 @@ export default function Page() {
 
         <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 12, marginBottom: 12 }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
-            <div style={{ fontWeight: 800 }}>{connected ? shortAddr(addr) : "Кошелёк не подключен"}</div>
+            <div style={{ fontWeight: 800 }}>
+              {connected ? shortAddr(addr) : "Кошелёк не подключен"}
+            </div>
+
             {!connected && (
               <button
                 onClick={connectWallet}
