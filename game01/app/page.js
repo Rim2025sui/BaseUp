@@ -3,34 +3,27 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { ethers } from 'ethers';
 
-/**
- * FIXES:
- * - Attempts never goes above 7 (no "8/7")
- * - Leaderboard uses raw JSON-RPC eth_getLogs (no ENS / no getEnsAddress)
- * - Basename + avatar via Basenames L2 Resolver (no resolver(bytes32) -> no BAD_DATA)
- */
-
-// === CONFIG ===
+// ===== CONFIG =====
 const CHAIN_ID = 8453;
 const CHAIN_HEX = '0x2105';
 
-const READ_RPC_URL = 'https://mainnet.base.org';
+const RPC_URLS = [
+  'https://mainnet.base.org',
+  'https://base.llamarpc.com',
+  'https://1rpc.io/base',
+  'https://rpc.ankr.com/base',
+];
 
 const CONTRACT_ADDRESS = '0x622678862992c0A2414b536Bc4B8B391602BCf';
 
-// Basenames L2 Resolver (Base docs)
+// Basenames L2 Resolver
 const BASENAME_L2_RESOLVER_ADDRESS = '0xC6d566A56A1aFf6508b41f6c90ff131615583BCD';
 
-// Leaderboard lookback (не 200k)
 const LOOKBACK_BLOCKS = 80_000;
-
-// max attempts
 const MAX_ATTEMPTS = 7;
-
-// fixed gas for write
 const GAS_HEX = '0x249F0'; // 150000
 
-// === ABI ===
+// ===== ABI =====
 const L2_RESOLVER_ABI = [
   'function name(bytes32 node) view returns (string)',
   'function text(bytes32 node, string key) view returns (string)',
@@ -43,13 +36,12 @@ const GAME_WRITE_ABI = [
   'function submit(uint256 score, uint256 guess)',
 ];
 
-// event candidates (user is indexed!)
 const EVENT_SIGS = [
   'Played(address,uint256,uint256,uint256)',
   'GamePlayed(address,uint256,uint256,uint256)',
 ];
 
-// === utils ===
+// ===== utils =====
 function shortAddr(a) {
   if (!a) return '';
   return a.slice(0, 6) + '…' + a.slice(-4);
@@ -57,41 +49,39 @@ function shortAddr(a) {
 
 function ipfsToHttp(url) {
   if (!url) return '';
-  if (url.startsWith('ipfs://')) {
-    const cid = url.replace('ipfs://', '');
-    return `https://ipfs.io/ipfs/${cid}`;
-  }
+  if (url.startsWith('ipfs://')) return `https://ipfs.io/ipfs/${url.slice('ipfs://'.length)}`;
   return url;
 }
 
 function calcScore(attemptsUsed) {
-  // 1..7 attempts -> score 7..1 (как у тебя было)
-  // attemptsUsed=5 => score=3
   return Math.max(1, 8 - attemptsUsed);
 }
 
 function randomSecret() {
-  return 60 + Math.floor(Math.random() * 61); // 60..120
+  return 60 + Math.floor(Math.random() * 61);
 }
 
 function intToHex(n) {
   return '0x' + Number(n).toString(16);
 }
 
-async function rpc(method, params) {
-  const res = await fetch(READ_RPC_URL, {
+async function rpcFetch(url, method, params) {
+  const res = await fetch(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
   });
   const j = await res.json();
-  if (j.error) throw new Error(j.error.message || 'RPC error');
+  if (j?.error) throw new Error(j.error.message || 'RPC error');
   return j.result;
 }
 
 export default function Page() {
-  // READ provider for contract calls (no network name -> no ENS ops)
-  const readProvider = useMemo(() => new ethers.JsonRpcProvider(READ_RPC_URL), []);
+  const [activeRpc, setActiveRpc] = useState(RPC_URLS[0]);
+
+  // read provider (привязан к activeRpc)
+  const readProvider = useMemo(() => new ethers.JsonRpcProvider(activeRpc), [activeRpc]);
+
   const l2ResolverRead = useMemo(
     () => new ethers.Contract(BASENAME_L2_RESOLVER_ADDRESS, L2_RESOLVER_ABI, readProvider),
     [readProvider]
@@ -126,15 +116,15 @@ export default function Page() {
 
   // leaderboard
   const [leaderboard, setLeaderboard] = useState([]);
-  const [lbStatus, setLbStatus] = useState('');
+  const [lbStatus, setLbStatus] = useState('Нажми “Обновить лидерборд”.');
 
   // write method cache
   const [writeMethod, setWriteMethod] = useState('');
 
-  // persist game state
+  // STATE persist
   useEffect(() => {
     try {
-      const raw = localStorage.getItem('baseup_state_v2');
+      const raw = localStorage.getItem('baseup_state_v3');
       if (!raw) return;
       const s = JSON.parse(raw);
       if (typeof s.secret === 'number') setSecret(s.secret);
@@ -150,7 +140,7 @@ export default function Page() {
   useEffect(() => {
     try {
       localStorage.setItem(
-        'baseup_state_v2',
+        'baseup_state_v3',
         JSON.stringify({ secret, attempts, wins, rounds, bestScore, totalScore, lastWin })
       );
     } catch {}
@@ -195,8 +185,8 @@ export default function Page() {
 
     const bp = new ethers.BrowserProvider(window.ethereum);
     await bp.send('eth_requestAccounts', []);
-
     const signer = await bp.getSigner();
+
     const a = await signer.getAddress();
     setAddress(a);
 
@@ -205,20 +195,32 @@ export default function Page() {
     setChainId(cid);
 
     if (cid !== CHAIN_ID) {
-      try {
-        await window.ethereum.request({
-          method: 'wallet_switchEthereumChain',
-          params: [{ chainId: CHAIN_HEX }],
-        });
-        setChainId(CHAIN_ID);
-      } catch {
-        throw new Error('Переключи сеть на Base (8453) и повтори.');
-      }
+      await window.ethereum.request({
+        method: 'wallet_switchEthereumChain',
+        params: [{ chainId: CHAIN_HEX }],
+      });
+      setChainId(CHAIN_ID);
     }
+
     return signer;
   }
 
-  // basename (no resolver(bytes32))
+  // RPC with fallback
+  async function rpc(method, params) {
+    let lastErr = null;
+    for (const url of RPC_URLS) {
+      try {
+        const result = await rpcFetch(url, method, params);
+        if (activeRpc !== url) setActiveRpc(url);
+        return result;
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    throw new Error(lastErr?.message || 'RPC недоступен');
+  }
+
+  // basename (не ломает игру, просто не найдёт если reverse не выставлен)
   async function refreshBasename() {
     setErr('');
     setNameStatus('Обновляю имя...');
@@ -257,7 +259,6 @@ export default function Page() {
     }
   }
 
-  // game controls
   function newRound() {
     setErr('');
     setDiag('');
@@ -274,7 +275,6 @@ export default function Page() {
     setDiag('');
     setSavedTx('');
 
-    // FIX: never allow attempts > 7
     if (attempts >= MAX_ATTEMPTS) {
       setHint('❌ Попытки закончились. Нажми "Новый раунд".');
       return;
@@ -299,7 +299,6 @@ export default function Page() {
       setBestScore((b) => Math.max(b, score));
       setTotalScore((t) => t + score);
       setLastWin({ guessK, score });
-
       return;
     }
 
@@ -321,7 +320,6 @@ export default function Page() {
     for (const fn of candidates) {
       try {
         const data = iface.encodeFunctionData(fn, [1, 1]);
-        // call via READ provider (safe)
         await readProvider.call({ to: CONTRACT_ADDRESS, from, data });
         setWriteMethod(fn);
         return fn;
@@ -332,7 +330,7 @@ export default function Page() {
 
   async function saveOnchain() {
     setErr('');
-    setDiag('Диагностика: готовлю транзакцию...');
+    setDiag('Готовлю транзакцию...');
     setSavedTx('');
 
     try {
@@ -343,23 +341,19 @@ export default function Page() {
 
       const contract = new ethers.Contract(CONTRACT_ADDRESS, GAME_WRITE_ABI, signer);
 
-      // send tx (score, guessK)
-      setDiag('Диагностика: жду окно подписи...');
+      setDiag('Жду окно подписи...');
       const tx = await contract[fn](lastWin.score, lastWin.guessK, {
         gasLimit: BigInt(parseInt(GAS_HEX, 16)),
       });
 
       setSavedTx(tx.hash);
-      setDiag(`Диагностика: TX отправлена: ${tx.hash}`);
-
-      await fetchLeaderboard();
+      setDiag(`TX отправлена: ${tx.hash}`);
     } catch (e) {
       setDiag('');
       setErr(e?.message || String(e));
     }
   }
 
-  // LEADERBOARD: raw RPC eth_getLogs (NO ENS)
   async function fetchLeaderboard() {
     setErr('');
     setLbStatus('Обновляю лидерборд...');
@@ -369,7 +363,7 @@ export default function Page() {
       const latest = parseInt(latestHex, 16);
       const fromBlock = Math.max(0, latest - LOOKBACK_BLOCKS);
 
-      const topics0 = EVENT_SIGS.map((sig) => ethers.id(sig)); // keccak
+      const topics0 = EVENT_SIGS.map((sig) => ethers.id(sig));
       const logs = await rpc('eth_getLogs', [
         {
           address: CONTRACT_ADDRESS,
@@ -379,17 +373,14 @@ export default function Page() {
         },
       ]);
 
-      // decode: user is topics[1] (indexed), data has 3 uint256: score, guess, ts
       const coder = ethers.AbiCoder.defaultAbiCoder();
       const map = new Map();
-
-      // limit processing to last N logs to keep UI fast
       const slice = logs.length > 600 ? logs.slice(logs.length - 600) : logs;
 
       for (const l of slice) {
         if (!l?.topics?.[1]) continue;
-
         const user = ('0x' + l.topics[1].slice(26)).toLowerCase();
+
         const decoded = coder.decode(['uint256', 'uint256', 'uint256'], l.data);
         const score = Number(decoded[0]);
 
@@ -406,19 +397,13 @@ export default function Page() {
         .slice(0, 10);
 
       setLeaderboard(top);
-      setLbStatus(`Ок. Событий в lookback: ${logs.length}`);
+      setLbStatus(`Ок. Логи: ${logs.length}. RPC: ${activeRpc}`);
     } catch (e) {
       setLeaderboard([]);
-      setLbStatus('');
+      setLbStatus('RPC сейчас нестабилен. Нажми “Обновить лидерборд” позже.');
       setErr(`Лидерборд: ${e?.message || String(e)}`);
     }
   }
-
-  // initial load
-  useEffect(() => {
-    fetchLeaderboard().catch(() => {});
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 
   useEffect(() => {
     if (address) refreshBasename().catch(() => {});
@@ -436,10 +421,12 @@ export default function Page() {
             <div style={{ color: '#6b7280', marginTop: 4 }}>
               ChainId: <b>{chainId}</b> <br />
               Контракт: <b>{CONTRACT_ADDRESS}</b>
+              <br />
+              RPC: <b style={{ fontSize: 12 }}>{activeRpc}</b>
             </div>
 
             <div style={{ marginTop: 10 }}>
-              <div style={{ fontWeight: 700, color: '#111827' }}>Base Name:</div>
+              <div style={{ fontWeight: 700 }}>Base Name:</div>
               <div style={{ color: basename ? '#111827' : '#b91c1c', marginTop: 2 }}>
                 {basename ? basename : 'не найден (скорее всего не выставлен reverse/primary record).'}
               </div>
@@ -447,7 +434,7 @@ export default function Page() {
               {avatarUrl ? (
                 <div style={{ marginTop: 10, display: 'flex', alignItems: 'center', gap: 10 }}>
                   <img src={avatarUrl} alt="avatar" width={44} height={44} style={{ borderRadius: 12, border: '1px solid #e5e7eb' }} />
-                  <span style={{ color: '#6b7280', fontSize: 13 }}>avatar (text record)</span>
+                  <span style={{ color: '#6b7280', fontSize: 13 }}>avatar</span>
                 </div>
               ) : null}
 
@@ -527,7 +514,7 @@ export default function Page() {
               {leaderboard.length === 0 ? (
                 <tr>
                   <td colSpan={5} style={{ padding: 12, color: '#6b7280' }}>
-                    Нет данных (или событий нет в lookback).
+                    Нет данных (или пока не обновлял лидерборд).
                   </td>
                 </tr>
               ) : (
@@ -548,7 +535,7 @@ export default function Page() {
         </div>
 
         <div style={{ marginTop: 10, color: '#6b7280', fontSize: 12 }}>
-          Лидерборд берётся из логов за последние {LOOKBACK_BLOCKS.toLocaleString()} блоков (без ENS).
+          Лидерборд берётся из логов за последние {LOOKBACK_BLOCKS.toLocaleString()} блоков. Если RPC лёг — просто нажми позже.
         </div>
       </div>
     </main>
