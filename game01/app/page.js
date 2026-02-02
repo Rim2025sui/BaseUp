@@ -21,7 +21,7 @@ const BASE_MAINNET = {
 
 const ACTIVE = BASE_MAINNET;
 
-// ✅ адрес берём из .env.local (а не хардкод)
+// ✅ адрес берём из .env.local, иначе fallback (твой рабочий контракт со скрина)
 const CONTRACT_ADDRESS =
   process.env.NEXT_PUBLIC_CONTRACT_ADDRESS || '0x085439394e6FEac14FFB61134ba8F81fA8A9f314';
 
@@ -29,6 +29,9 @@ const CONTRACT_ABI = [
   'function played(uint256 score, uint256 guess) external',
   'event Played(address indexed user, uint256 score, uint256 guess, uint256 ts)',
 ];
+
+// ТВОЙ basename (используем ТОЛЬКО как fallback, и только если forward-resolve == твой addr)
+const KNOWN_BASENAME = 'rimbasenamber1.base.eth';
 
 function randomInt(min, max) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
@@ -58,7 +61,7 @@ function shortAddr(a) {
 
 // Лёгкий blockies-аватар без зависимостей (canvas→dataURL)
 function addrToAvatar(address, size = 6, scale = 8) {
-  if (!address || typeof document === 'undefined') return null;
+  if (!address) return null;
 
   let seed = 0;
   for (let i = 0; i < address.length; i++) seed = (seed * 31 + address.charCodeAt(i)) >>> 0;
@@ -80,7 +83,6 @@ function addrToAvatar(address, size = 6, scale = 8) {
 
   ctx.fillStyle = fg;
   const cells = 5;
-
   for (let y = 0; y < cells; y++) {
     for (let x = 0; x < Math.ceil(cells / 2); x++) {
       const on = rand() > 0.5;
@@ -94,40 +96,6 @@ function addrToAvatar(address, size = 6, scale = 8) {
   return canvas.toDataURL('image/png');
 }
 
-async function hydrateProfile(provider, address) {
-  // Возвращаем { displayName, avatarUrl } — НЕ ломаемся, если сеть/провайдер не умеет
-  const fallback = { displayName: shortAddr(address), avatarUrl: addrToAvatar(address) };
-
-  try {
-    if (!provider || !address) return fallback;
-
-    let name = null;
-    try {
-      // На некоторых провайдерах Base reverse может работать, на некоторых нет — поэтому try/catch
-      name = await provider.lookupAddress(address);
-    } catch {
-      name = null;
-    }
-
-    if (!name) return fallback;
-
-    let avatar = null;
-    try {
-      // Если имя поддерживает avatar (ENS-like) — попробуем
-      avatar = await provider.getAvatar(name);
-    } catch {
-      avatar = null;
-    }
-
-    return {
-      displayName: name,
-      avatarUrl: avatar || fallback.avatarUrl,
-    };
-  } catch {
-    return fallback;
-  }
-}
-
 export default function Page() {
   // wallet
   const [hasProvider, setHasProvider] = useState(false);
@@ -139,6 +107,7 @@ export default function Page() {
   // profile (avatar + display name)
   const [profileName, setProfileName] = useState('-');
   const [profileAvatar, setProfileAvatar] = useState(null);
+  const [baseNameNote, setBaseNameNote] = useState(''); // пояснение почему не найдено
 
   // game
   const [targetK, setTargetK] = useState(() => randomInt(MIN_K, MAX_K));
@@ -201,7 +170,7 @@ export default function Page() {
   }
 
   function onInputChange(e) {
-    const v = (e.target.value || '').replace(/[^\d]/g, '').slice(0, 3);
+    const v = String(e.target.value || '').replace(/[^\d]/g, '').slice(0, 3);
     setInputRaw(v);
   }
 
@@ -210,6 +179,56 @@ export default function Page() {
     if (!Number.isInteger(k)) return 'Только целые числа.';
     if (k < MIN_K || k > MAX_K) return `Только от ${MIN_K} до ${MAX_K}.`;
     return '';
+  }
+
+  // ===== Profile resolve =====
+  async function resolveBaseName(eth, address) {
+    // Всегда даём аватар от адреса (без внешних источников)
+    try {
+      setProfileAvatar(addrToAvatar(address));
+    } catch {
+      setProfileAvatar(null);
+    }
+
+    setBaseNameNote('');
+    setProfileName(shortAddr(address));
+
+    try {
+      const provider = new ethers.BrowserProvider(eth);
+
+      // 1) reverse lookup (если выставлен)
+      let name = null;
+      try {
+        name = await provider.lookupAddress(address);
+      } catch {
+        name = null;
+      }
+
+      if (name) {
+        setProfileName(name);
+        setBaseNameNote('');
+        return;
+      }
+
+      // 2) fallback: проверяем ТВОЁ known имя через forward-resolve
+      // и используем его ТОЛЬКО если оно реально указывает на этот адрес
+      try {
+        const resolved = await provider.resolveName(KNOWN_BASENAME);
+        if (resolved && resolved.toLowerCase() === address.toLowerCase()) {
+          setProfileName(KNOWN_BASENAME);
+          setBaseNameNote('reverse не выставлен (показываю имя по forward-resolve)');
+          return;
+        }
+      } catch {
+        // ignore
+      }
+
+      setProfileName('не найден');
+      setBaseNameNote('скорее всего reverse (Primary) не выставлен, поэтому lookupAddress вернул null');
+    } catch {
+      setProfileName(shortAddr(address));
+      setBaseNameNote('не удалось сделать lookup');
+    }
   }
 
   // ===== Wallet helpers =====
@@ -222,36 +241,23 @@ export default function Page() {
       const connected = Array.isArray(accounts) && accounts.length > 0;
       setIsConnected(connected);
 
+      const cidHex = await eth.request({ method: 'eth_chainId' });
+      setChainId(parseInt(cidHex, 16));
+
       if (connected) {
         const a = accounts[0];
         setAddr(a);
         setStatus('Подключено');
 
-        // Быстрый UI (сразу), потом — попытка вытянуть basename + avatar
-        setProfileName(shortAddr(a));
-        try {
-          setProfileAvatar(addrToAvatar(a));
-        } catch {
-          setProfileAvatar(null);
-        }
-
-        try {
-          const provider = new ethers.BrowserProvider(eth);
-          const prof = await hydrateProfile(provider, a);
-          setProfileName(prof.displayName || shortAddr(a));
-          setProfileAvatar(prof.avatarUrl || addrToAvatar(a));
-        } catch {
-          // не критично
-        }
+        // имя + аватар
+        await resolveBaseName(eth, a);
       } else {
         setAddr('');
         setStatus('Не подключено');
         setProfileName('-');
         setProfileAvatar(null);
+        setBaseNameNote('');
       }
-
-      const cidHex = await eth.request({ method: 'eth_chainId' });
-      setChainId(parseInt(cidHex, 16));
     } catch (e) {
       setErr(formatError(e));
     }
@@ -308,6 +314,17 @@ export default function Page() {
     }
   }
 
+  async function refreshBaseNameManual() {
+    setErr('');
+    try {
+      const eth = window.ethereum;
+      if (!eth || !addr) return;
+      await resolveBaseName(eth, addr);
+    } catch (e) {
+      setErr(formatError(e));
+    }
+  }
+
   useEffect(() => {
     const eth = window.ethereum;
     setHasProvider(!!eth);
@@ -357,7 +374,7 @@ export default function Page() {
       setTotalScore((s) => s + roundScore);
       setBestRoundScore((b) => Math.max(b, roundScore));
 
-      setHint('✅ Правильно!');
+      setHint('✅ Угадал!');
       setWins((w) => w + 1);
       setRounds((r) => r + 1);
 
@@ -397,7 +414,7 @@ export default function Page() {
     setLbLoading(true);
     setLbInfo('');
     try {
-      const url = `/api/leaderboard?limit=10${force ? '&t=' + Date.now() : ''}`;
+      const url = `/api/leaderboard?limit=10${force ? `&t=${Date.now()}` : ''}`;
       const res = await fetch(url, { cache: 'no-store' });
       const json = await res.json();
 
@@ -423,7 +440,7 @@ export default function Page() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ===== HARD DIAG: check contract реально ли контракт и можно ли вызвать played =====
+  // ===== HARD DIAG =====
   async function diagnose(provider) {
     const net = await provider.getNetwork();
     const currentChainId = Number(net.chainId);
@@ -485,7 +502,7 @@ export default function Page() {
         await contract.played.staticCall(BigInt(lastWin.score), BigInt(lastWin.guessK));
       } catch (se) {
         console.error('staticCall error', se);
-        setTxMsg('simulate (staticCall) упал — попробую отправить транзакцию с gasLimit...');
+        setTxMsg('simulate (staticCall) упал — отправляю транзакцию с gasLimit...');
       }
 
       let gasLimit = 180000n;
@@ -585,12 +602,22 @@ export default function Page() {
           </div>
 
           <div style={{ lineHeight: 1.25, width: '100%' }}>
-            <div style={{ fontWeight: 700 }}>{profileName}</div>
-            <div style={{ fontSize: 12, color: '#666' }}>
+            <div style={{ fontWeight: 700 }}>
+              Base Name: <span style={{ fontFamily: 'monospace' }}>{profileName}</span>
+            </div>
+
+            {baseNameNote ? (
+              <div style={{ fontSize: 12, color: '#777', marginTop: 2 }}>{baseNameNote}</div>
+            ) : null}
+
+            <div style={{ fontSize: 12, color: '#666', marginTop: 2 }}>
               {status}
               {isConnected && !isCorrectChain ? ' · не та сеть' : ''}
             </div>
-            <div style={{ fontSize: 12, color: '#8b8b8b', wordBreak: 'break-all' }}>{addr ? shortAddr(addr) : '-'}</div>
+
+            <div style={{ fontSize: 12, color: '#8b8b8b', wordBreak: 'break-all' }}>
+              Адрес: {addr ? shortAddr(addr) : '-'}
+            </div>
           </div>
         </div>
 
@@ -616,6 +643,10 @@ export default function Page() {
               Switch to Base Mainnet
             </button>
           )}
+
+          <button style={{ padding: '10px 14px' }} onClick={refreshBaseNameManual} disabled={!isConnected}>
+            Обновить Base Name
+          </button>
 
           <button style={{ padding: '10px 14px' }} onClick={resetRound}>
             Новый раунд
