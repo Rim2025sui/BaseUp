@@ -1,691 +1,472 @@
-'use client';
+"use client";
 
-import React, { useEffect, useMemo, useState } from 'react';
-import { ethers } from 'ethers';
-import { sdk } from '@farcaster/frame-sdk';
+import React, { useEffect, useMemo, useState } from "react";
+import { ethers } from "ethers";
 
-// === SETTINGS ===
-const MIN_K = 60;
-const MAX_K = 120;
-const MAX_ATTEMPTS = 7;
+// =======================
+// НАСТРОЙКИ (1 место)
+// =======================
+const BASE_CHAIN_ID = 8453;
+const BASE_CHAIN_ID_HEX = "0x2105";
+const CONTRACT_ADDRESS = "0x622678862992c0A2414b536Bc4B8B391602BCf";
 
-// === BASE MAINNET ===
-const BASE_MAINNET = {
-  chainIdDec: 8453,
-  chainIdHex: '0x2105',
-  chainName: 'Base Mainnet',
-  nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 },
-  rpcUrls: ['https://mainnet.base.org'],
-  blockExplorerUrls: ['https://basescan.org'],
-};
+// ВАЖНО: имя write-функции контракта (поменяешь ТОЛЬКО ЭТО, если у тебя другое имя)
+// Примеры: "play", "saveResult", "record", "save"
+const WRITE_METHOD = "play";
 
-const ACTIVE = BASE_MAINNET;
+// ВАЖНО: порядок аргументов в write-функции
+// true  => (score, guess)
+// false => (guess, score)
+const SEND_SCORE_FIRST = true;
 
-// ENS registry canonical address (часто используется на L2; если на Base другой — просто вернёт null)
-const ENS_REGISTRY = '0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e';
-
-// Адрес контракта: берём из .env, иначе fallback на твой
-const CONTRACT_ADDRESS =
-  process.env.NEXT_PUBLIC_CONTRACT_ADDRESS || '0x622678862992c0A2414b536Bc4B8B391602BCf';
-
-const CONTRACT_ABI = [
-  'function played(uint256 score, uint256 guess) external',
-  'event Played(address indexed user, uint256 score, uint256 guess, uint256 ts)',
+// Минимальный ABI: event + write-функция
+// Если твой write метод другой, но с теми же 2 uint256 — просто меняешь WRITE_METHOD сверху.
+const ABI = [
+  {
+    anonymous: false,
+    inputs: [
+      { indexed: true, internalType: "address", name: "user", type: "address" },
+      { indexed: false, internalType: "uint256", name: "score", type: "uint256" },
+      { indexed: false, internalType: "uint256", name: "guess", type: "uint256" },
+      { indexed: false, internalType: "uint256", name: "ts", type: "uint256" },
+    ],
+    name: "GamePlayed",
+    type: "event",
+  },
+  {
+    inputs: [
+      { internalType: "uint256", name: "a", type: "uint256" },
+      { internalType: "uint256", name: "b", type: "uint256" },
+    ],
+    name: WRITE_METHOD,
+    outputs: [],
+    stateMutability: "nonpayable",
+    type: "function",
+  },
 ];
 
-function randomInt(min, max) {
-  return Math.floor(Math.random() * (max - min + 1)) + min;
+// =======================
+// Утилиты
+// =======================
+function clampInt(n, lo, hi) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return null;
+  const y = Math.trunc(x);
+  if (y < lo || y > hi) return null;
+  return y;
 }
 
-function formatError(e) {
-  try {
-    const parts = [];
-    if (e?.shortMessage) parts.push(`short=${e.shortMessage}`);
-    if (e?.message) parts.push(`msg=${e.message}`);
-    if (e?.code) parts.push(`code=${e.code}`);
-    if (e?.reason) parts.push(`reason=${e.reason}`);
-    if (e?.data) {
-      const d = typeof e.data === 'string' ? e.data : JSON.stringify(e.data);
-      parts.push(`data=${d}`);
-    }
-    return parts.length ? parts.join(' | ') : String(e);
-  } catch {
-    return String(e?.message || e);
-  }
+function randomInt(lo, hi) {
+  // inclusive
+  return lo + Math.floor(Math.random() * (hi - lo + 1));
 }
 
 function shortAddr(a) {
-  return a ? `${a.slice(0, 6)}…${a.slice(-4)}` : '-';
+  if (!a || typeof a !== "string") return "";
+  return a.slice(0, 6) + "…" + a.slice(-4);
 }
 
-// Мини-blockies без зависимостей
-function addrToAvatar(address, size = 6, scale = 8) {
-  if (!address) return null;
-
-  let seed = 0;
-  for (let i = 0; i < address.length; i++) seed = (seed * 31 + address.charCodeAt(i)) >>> 0;
-  const rand = () => ((seed = (seed * 1103515245 + 12345) >>> 0) / 2 ** 32);
-
-  const canvas = document.createElement('canvas');
-  const N = size * scale;
-  canvas.width = N;
-  canvas.height = N;
-  const ctx = canvas.getContext('2d');
-
-  ctx.fillStyle = '#eef3f9';
-  ctx.fillRect(0, 0, N, N);
-
-  const baseHue = Math.floor(rand() * 360);
-  const fg = `hsl(${baseHue},70%,45%)`;
-  const bg = `hsl(${(baseHue + 180) % 360},60%,92%)`;
-
-  ctx.fillStyle = bg;
-  ctx.fillRect(0, 0, N, N);
-  ctx.fillStyle = fg;
-
-  const cells = 5;
-  for (let y = 0; y < cells; y++) {
-    for (let x = 0; x < Math.ceil(cells / 2); x++) {
-      const on = rand() > 0.5;
-      if (on) {
-        ctx.fillRect(x * scale, y * scale, scale, scale);
-        ctx.fillRect((cells - 1 - x) * scale, y * scale, scale, scale);
-      }
-    }
-  }
-  return canvas.toDataURL('image/png');
+function formatEthersErr(e) {
+  const short = e?.shortMessage;
+  const msg = e?.message;
+  const code = e?.code ? ` | code=${e.code}` : "";
+  if (short) return `${short}${code}`;
+  if (msg) return `${msg}${code}`;
+  return String(e);
 }
 
-// --- BaseName reverse lookup (если reverse record выставлен) ---
-async function lookupReverseNameOnBase(address) {
+// НЕ ДОЛЖНО ЛОМАТЬ ПРИЛОЖЕНИЕ (ENS может падать на Base)
+async function safeLookupBaseName(provider, address) {
   try {
-    const rpc = ACTIVE.rpcUrls[0];
-    const provider = new ethers.JsonRpcProvider(rpc);
-
-    const a = (address || '').toLowerCase();
-    if (!a.startsWith('0x') || a.length !== 42) return null;
-
-    const node = ethers.namehash(`${a.slice(2)}.addr.reverse`);
-
-    const registry = new ethers.Contract(
-      ENS_REGISTRY,
-      ['function resolver(bytes32 node) view returns (address)'],
-      provider
-    );
-
-    const resolverAddr = await registry.resolver(node);
-    if (!resolverAddr || resolverAddr === ethers.ZeroAddress) return null;
-
-    const resolver = new ethers.Contract(
-      resolverAddr,
-      ['function name(bytes32 node) view returns (string)'],
-      provider
-    );
-
-    const name = await resolver.name(node);
-    return name && typeof name === 'string' && name.length ? name : null;
+    const name = await provider.lookupAddress(address);
+    return name || null;
   } catch {
     return null;
   }
 }
 
+// =======================
+// UI
+// =======================
 export default function Page() {
-  // wallet
-  const [hasProvider, setHasProvider] = useState(false);
-  const [isConnected, setIsConnected] = useState(false);
-  const [addr, setAddr] = useState('');
+  // Wallet / chain
+  const [addr, setAddr] = useState("");
+  const [baseName, setBaseName] = useState(null);
   const [chainId, setChainId] = useState(null);
-  const [status, setStatus] = useState('Не подключено');
 
-  // profile
-  const [profileName, setProfileName] = useState('-');
-  const [profileAvatar, setProfileAvatar] = useState(null);
-  const [baseNameInfo, setBaseNameInfo] = useState(''); // текст диагностики
-
-  // game
-  const [targetK, setTargetK] = useState(() => randomInt(MIN_K, MAX_K));
-  const [inputRaw, setInputRaw] = useState('');
-  const [hint, setHint] = useState('');
-  const [attemptsThisRound, setAttemptsThisRound] = useState(0);
-  const [rounds, setRounds] = useState(0);
+  // Game
+  const [secretK, setSecretK] = useState(() => randomInt(60, 120));
+  const [guess, setGuess] = useState("");
+  const [hint, setHint] = useState("-");
+  const [tries, setTries] = useState(0);
+  const [rounds, setRounds] = useState(1);
   const [wins, setWins] = useState(0);
 
-  // score
-  const [totalScore, setTotalScore] = useState(0);
-  const [lastRoundScore, setLastRoundScore] = useState(0);
-  const [bestRoundScore, setBestRoundScore] = useState(0);
+  // Scores
+  const [lastWinGuess, setLastWinGuess] = useState(null);
+  const [lastWinScore, setLastWinScore] = useState(null);
+  const [savedTx, setSavedTx] = useState("-");
+  const [bestRound, setBestRound] = useState(0);
+  const [totalPoints, setTotalPoints] = useState(0);
 
-  // last win persists
-  const [lastWin, setLastWin] = useState(null); // { score, guessK, ts }
-  const [lastSavedTx, setLastSavedTx] = useState('');
+  // Status
+  const [diag, setDiag] = useState("");
+  const [err, setErr] = useState("");
 
-  // onchain ui
-  const [isSaving, setIsSaving] = useState(false);
-  const [txHash, setTxHash] = useState('');
-  const [txMsg, setTxMsg] = useState('');
-  const [err, setErr] = useState('');
+  const attemptsMax = 7;
 
-  const isCorrectChain = chainId === ACTIVE.chainIdDec;
+  const connected = !!addr;
 
-  const interpretedK = useMemo(() => {
-    const t = (inputRaw || '').trim();
-    if (t === '') return null;
-    if (!/^\d+$/.test(t)) return null;
-    if (t.length > 3) return null;
-    const n = Number(t);
-    if (!Number.isFinite(n)) return null;
-    return n;
-  }, [inputRaw]);
+  const lastWinBlock = useMemo(() => {
+    const g = lastWinGuess == null ? "-" : `${lastWinGuess}k`;
+    const s = lastWinScore == null ? "-" : `${lastWinScore}`;
+    return { g, s };
+  }, [lastWinGuess, lastWinScore]);
 
-  const interpretedLabel = useMemo(() => {
-    if (interpretedK === null) return '';
-    return `${interpretedK}k`;
-  }, [interpretedK]);
-
-  const interpretedUsd = useMemo(() => {
-    if (interpretedK === null) return null;
-    return interpretedK * 1000;
-  }, [interpretedK]);
-
-  function resetRound() {
-    setTargetK(randomInt(MIN_K, MAX_K));
-    setAttemptsThisRound(0);
-    setInputRaw('');
-    setHint('');
-    setLastRoundScore(0);
-    setErr('');
-    setTxMsg('');
-    setTxHash('');
-  }
-
-  function onInputChange(e) {
-    const v = String(e.target.value || '').replace(/[^\d]/g, '').slice(0, 3);
-    setInputRaw(v);
-  }
-
-  function validateRangeK(k) {
-    if (k === null) return 'Введите число.';
-    if (!Number.isInteger(k)) return 'Только целые числа.';
-    if (k < MIN_K || k > MAX_K) return `Только от ${MIN_K} до ${MAX_K}.`;
-    return '';
-  }
-
-  async function refreshBaseName(address) {
-    try {
-      setBaseNameInfo('Ищу Base Name…');
-      const name = await lookupReverseNameOnBase(address);
-      if (name) {
-        setProfileName(name);
-        setBaseNameInfo('');
-        return;
-      }
-      setProfileName(shortAddr(address));
-      setBaseNameInfo('Base Name: не найден (скорее всего не выставлен reverse/primary record).');
-    } catch {
-      setProfileName(shortAddr(address));
-      setBaseNameInfo('Base Name: не найден.');
-    }
-  }
-
-  // ===== Wallet helpers =====
-  async function refreshWalletState() {
-    try {
-      const eth = window.ethereum;
-      if (!eth) return;
-
-      const accounts = await eth.request({ method: 'eth_accounts' });
-      const connected = Array.isArray(accounts) && accounts.length > 0;
-      setIsConnected(connected);
-
-      if (connected) {
-        const a = accounts[0];
-        setAddr(a);
-        setStatus('Подключено');
-
-        // avatar
-        try {
-          setProfileAvatar(addrToAvatar(a));
-        } catch {
-          setProfileAvatar(null);
-        }
-
-        // name (reverse)
-        await refreshBaseName(a);
-      } else {
-        setAddr('');
-        setStatus('Не подключено');
-        setProfileName('-');
-        setProfileAvatar(null);
-        setBaseNameInfo('');
-      }
-
-      const cidHex = await eth.request({ method: 'eth_chainId' });
-      setChainId(parseInt(cidHex, 16));
-    } catch (e) {
-      setErr(formatError(e));
-    }
-  }
-
-  async function connectWallet() {
-    setErr('');
-    try {
-      const eth = window.ethereum;
-      if (!eth) {
-        setErr('Нет кошелька (window.ethereum). Открой в Base App / Coinbase Wallet / MetaMask.');
-        return;
-      }
-      await eth.request({ method: 'eth_requestAccounts' });
-      await refreshWalletState();
-    } catch (e) {
-      setErr(formatError(e));
-    }
-  }
-
-  async function switchToMainnet() {
-    setErr('');
-    try {
-      const eth = window.ethereum;
-      if (!eth) return;
-
-      try {
-        await eth.request({
-          method: 'wallet_switchEthereumChain',
-          params: [{ chainId: ACTIVE.chainIdHex }],
-        });
-      } catch (switchErr) {
-        if (switchErr?.code === 4902) {
-          await eth.request({
-            method: 'wallet_addEthereumChain',
-            params: [
-              {
-                chainId: ACTIVE.chainIdHex,
-                chainName: ACTIVE.chainName,
-                nativeCurrency: ACTIVE.nativeCurrency,
-                rpcUrls: ACTIVE.rpcUrls,
-                blockExplorerUrls: ACTIVE.blockExplorerUrls,
-              },
-            ],
-          });
-        } else {
-          throw switchErr;
-        }
-      }
-
-      await refreshWalletState();
-    } catch (e) {
-      setErr(formatError(e));
-    }
-  }
-
+  // =======================
+  // Init: Base App ready (не ломаем, если SDK нет)
+  // =======================
   useEffect(() => {
-    const eth = window.ethereum;
-    setHasProvider(!!eth);
-    if (!eth) return;
-
-    const onAccountsChanged = () => refreshWalletState();
-    const onChainChanged = () => refreshWalletState();
-
-    eth.on?.('accountsChanged', onAccountsChanged);
-    eth.on?.('chainChanged', onChainChanged);
-
-    refreshWalletState();
-
     try {
-      sdk.actions.ready();
+      // иногда в mini-app есть sdk в window
+      if (typeof window !== "undefined" && window?.sdk?.actions?.ready) {
+        window.sdk.actions.ready();
+      }
     } catch {}
-
-    return () => {
-      eth.removeListener?.('accountsChanged', onAccountsChanged);
-      eth.removeListener?.('chainChanged', onChainChanged);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ===== Game logic =====
-  function guessNow() {
-    setErr('');
-    setTxMsg('');
-    setTxHash('');
+  // =======================
+  // Подписки на смену аккаунта/сети
+  // =======================
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.ethereum) return;
 
-    const k = interpretedK;
-    const rangeErr = validateRangeK(k);
-    if (rangeErr) {
-      setErr(rangeErr);
-      return;
-    }
+    const onAccountsChanged = (accounts) => {
+      const a = accounts?.[0] || "";
+      setAddr(a);
+      setBaseName(null);
+      setSavedTx("-");
+      setErr("");
+      setDiag("");
+    };
 
-    const nextAttempts = attemptsThisRound + 1;
-    setAttemptsThisRound(nextAttempts);
+    const onChainChanged = (hex) => {
+      const id = parseInt(hex, 16);
+      setChainId(id);
+      setBaseName(null);
+      setSavedTx("-");
+      setErr("");
+      setDiag("");
+    };
 
-    if (k === targetK) {
-      const roundScore = Math.max(0, MAX_ATTEMPTS - nextAttempts + 1);
+    window.ethereum.on?.("accountsChanged", onAccountsChanged);
+    window.ethereum.on?.("chainChanged", onChainChanged);
 
-      setLastRoundScore(roundScore);
-      setTotalScore((s) => s + roundScore);
-      setBestRoundScore((b) => Math.max(b, roundScore));
+    return () => {
+      window.ethereum.removeListener?.("accountsChanged", onAccountsChanged);
+      window.ethereum.removeListener?.("chainChanged", onChainChanged);
+    };
+  }, []);
 
-      setHint('✅ Правильно!');
-      setWins((w) => w + 1);
-      setRounds((r) => r + 1);
-
-      const win = { score: roundScore, guessK: k, ts: Date.now() };
-      setLastWin(win);
-      setLastSavedTx('');
-
-      setTimeout(() => {
-        setTargetK(randomInt(MIN_K, MAX_K));
-        setAttemptsThisRound(0);
-        setInputRaw('');
-        setHint('');
-      }, 600);
-
-      return;
-    }
-
-    if (k < targetK) setHint('⬆️ Выше');
-    else setHint('⬇️ Ниже');
-
-    if (nextAttempts >= MAX_ATTEMPTS) {
-      setRounds((r) => r + 1);
-      setHint(`❌ Раунд проигран. Было: ${targetK}k`);
-      setLastRoundScore(0);
-
-      setTimeout(() => {
-        setTargetK(randomInt(MIN_K, MAX_K));
-        setAttemptsThisRound(0);
-        setInputRaw('');
-        setHint('');
-      }, 700);
-    }
-  }
-
-  // ===== HARD DIAG: check contract реально ли контракт и можно ли вызвать played =====
-  async function diagnose(provider) {
-    const net = await provider.getNetwork();
-    const currentChainId = Number(net.chainId);
-
-    const code = await provider.getCode(CONTRACT_ADDRESS);
-    const isContract = code && code !== '0x';
-
-    return { currentChainId, isContract, codeLen: code === '0x' ? 0 : code.length };
-  }
-
-  // ===== Onchain save =====
-  async function saveOnchain() {
-    setErr('');
-    setTxMsg('');
-    setTxHash('');
-
+  // =======================
+  // Connect
+  // =======================
+  async function connectWallet() {
     try {
-      const eth = window.ethereum;
-      if (!eth) return setErr('Нет provider (window.ethereum). Открой в кошельке (Base App/Coinbase/MetaMask).');
+      setErr("");
+      setDiag("");
 
-      const accounts = await eth.request({ method: 'eth_accounts' });
-      if (!Array.isArray(accounts) || accounts.length === 0) {
-        await eth.request({ method: 'eth_requestAccounts' });
-      }
-      await refreshWalletState();
+      if (!window.ethereum) throw new Error("Wallet не найден (нет window.ethereum)");
 
-      if (!lastWin) return setErr('Нет победы для сохранения. Сначала выиграй раунд.');
+      const bp = new ethers.BrowserProvider(window.ethereum);
+      await bp.send("eth_requestAccounts", []);
 
-      setIsSaving(true);
+      const signer = await bp.getSigner();
+      const a = await signer.getAddress();
+      setAddr(a);
 
-      const provider = new ethers.BrowserProvider(eth);
+      const net = await bp.getNetwork();
+      setChainId(Number(net.chainId));
 
-      setTxMsg('Диагностика сети/контракта...');
-      const d = await diagnose(provider);
+      // name pull не ломает app
+      const name = await safeLookupBaseName(bp, a);
+      setBaseName(name);
 
-      if (d.currentChainId !== ACTIVE.chainIdDec) {
-        setIsSaving(false);
-        return setErr(
-          `Не та сеть. Сейчас chainId=${d.currentChainId}. Нужна ${ACTIVE.chainName} (${ACTIVE.chainIdDec}). Нажми "Switch to Base Mainnet".`
-        );
-      }
-
-      if (!d.isContract) {
-        setIsSaving(false);
-        return setErr(`По адресу ${CONTRACT_ADDRESS} НЕТ контракта (getCode=0x). Проверь адрес/деплой в Base Mainnet.`);
-      }
-
-      const signer = await provider.getSigner();
-      const signerAddr = await signer.getAddress();
-      if (!signerAddr) {
-        setIsSaving(false);
-        return setErr('Signer не получен (кошелёк не дал адрес).');
-      }
-
-      const contract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, signer);
-
-      setTxMsg('Пробую estimateGas...');
-      let gasLimit = 200000n;
-      try {
-        const est = await contract.played.estimateGas(BigInt(lastWin.score), BigInt(lastWin.guessK));
-        gasLimit = est + est / 4n;
-      } catch {}
-
-      setTxMsg('Открываю кошелёк для подтверждения...');
-      const tx = await contract.played(BigInt(lastWin.score), BigInt(lastWin.guessK), { gasLimit });
-
-      setTxMsg('Ожидаю подтверждение...');
-      const receipt = await tx.wait();
-
-      const hash = receipt?.hash || tx?.hash || '';
-      setTxHash(hash);
-      setTxMsg('✅ Записано onchain!');
-      setLastSavedTx(hash);
+      setDiag(`Подключено: ${shortAddr(a)} | chainId=${Number(net.chainId)}`);
     } catch (e) {
-      setErr(formatError(e));
-    } finally {
-      setIsSaving(false);
+      setErr(formatEthersErr(e));
     }
   }
+
+  async function switchToBase() {
+    try {
+      setErr("");
+      setDiag("");
+      if (!window.ethereum) throw new Error("Wallet не найден (нет window.ethereum)");
+
+      await window.ethereum.request({
+        method: "wallet_switchEthereumChain",
+        params: [{ chainId: BASE_CHAIN_ID_HEX }],
+      });
+
+      // chainChanged сам прилетит, но подстрахуем
+      const bp = new ethers.BrowserProvider(window.ethereum);
+      const net = await bp.getNetwork();
+      setChainId(Number(net.chainId));
+      setDiag(`Сеть переключена: chainId=${Number(net.chainId)}`);
+    } catch (e) {
+      setErr(formatEthersErr(e));
+    }
+  }
+
+  async function refreshBaseName() {
+    try {
+      setErr("");
+      setDiag("");
+      if (!window.ethereum) throw new Error("Wallet не найден (нет window.ethereum)");
+      if (!addr) throw new Error("Сначала подключи кошелёк");
+
+      const bp = new ethers.BrowserProvider(window.ethereum);
+      const name = await safeLookupBaseName(bp, addr);
+      setBaseName(name);
+      setDiag(name ? `Base Name обновлён: ${name}` : "Base Name не найден (скорее всего не выставлен reverse/primary record).");
+    } catch (e) {
+      setErr(formatEthersErr(e));
+    }
+  }
+
+  // =======================
+  // Game actions
+  // =======================
+  function newRound() {
+    setErr("");
+    setDiag("");
+    setHint("-");
+    setTries(0);
+    setGuess("");
+    setSecretK(randomInt(60, 120));
+    setRounds((r) => r + 1);
+  }
+
+  function checkGuess() {
+    setErr("");
+    setDiag("");
+
+    const g = clampInt(guess, 60, 120);
+    if (g === null) {
+      setHint("Введи число 60…120");
+      return;
+    }
+
+    const nextTries = tries + 1;
+    setTries(nextTries);
+
+    if (g === secretK) {
+      // очки за победу: чем меньше попыток — тем больше
+      // 1 попытка => 7 очков, 7 попыток => 1 очко
+      const score = Math.max(1, attemptsMax + 1 - nextTries);
+
+      setHint("✅ Угадал!");
+      setWins((w) => w + 1);
+
+      setLastWinGuess(g);
+      setLastWinScore(score);
+      setSavedTx("-");
+
+      setBestRound((best) => Math.max(best, score));
+      setTotalPoints((t) => t + score);
+
+      // следующий раунд автоматически (как хочешь — я оставил “Новый раунд” кнопкой)
+      return;
+    }
+
+    if (g < secretK) setHint("🔼 Больше");
+    if (g > secretK) setHint("🔽 Меньше");
+
+    if (nextTries >= attemptsMax) {
+      setHint(`❌ Попытки закончились. Было: ${secretK}`);
+    }
+  }
+
+  // =======================
+  // Onchain save
+  // =======================
+  async function saveOnchain() {
+    try {
+      setErr("");
+      setDiag("Диагностика сети/контракта…");
+
+      if (!window.ethereum) throw new Error("Wallet не найден (нет window.ethereum)");
+      if (!addr) throw new Error("Сначала подключи кошелёк");
+      if (lastWinGuess == null || lastWinScore == null) throw new Error("Нет победы для сохранения (сначала выиграй раунд)");
+
+      // BrowserProvider -> signer (иначе транзы не будет)
+      const bp = new ethers.BrowserProvider(window.ethereum);
+      await bp.send("eth_requestAccounts", []);
+      const signer = await bp.getSigner();
+
+      const net = await bp.getNetwork();
+      const id = Number(net.chainId);
+      setChainId(id);
+
+      if (id !== BASE_CHAIN_ID) {
+        setDiag(`Нужно Base Mainnet (8453). Сейчас: ${id}. Переключаю…`);
+        await window.ethereum.request({
+          method: "wallet_switchEthereumChain",
+          params: [{ chainId: BASE_CHAIN_ID_HEX }],
+        });
+      }
+
+      const contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, signer);
+
+      const score = BigInt(lastWinScore);
+      const g = BigInt(lastWinGuess);
+
+      const a = SEND_SCORE_FIRST ? score : g;
+      const b = SEND_SCORE_FIRST ? g : score;
+
+      setDiag("Готовлю транзакцию… Ожидай окно кошелька.");
+      const tx = await contract[WRITE_METHOD](a, b);
+      setDiag(`TX отправлена: ${tx.hash}`);
+      setSavedTx(tx.hash);
+
+      const rc = await tx.wait();
+      setDiag(`TX подтверждена: ${rc.hash}`);
+      setSavedTx(rc.hash);
+    } catch (e) {
+      setErr(formatEthersErr(e));
+      setDiag("");
+    }
+  }
+
+  // =======================
+  // Render
+  // =======================
+  const baseNameText = baseName ? baseName : "не найден (скорее всего не выставлен reverse/primary record).";
 
   return (
-    <div
-      style={{
-        minHeight: '100vh',
-        backgroundImage: "url('/bg.jpg')",
-        backgroundRepeat: 'no-repeat',
-        backgroundPosition: 'top center',
-        backgroundSize: 'contain',
-        backgroundColor: '#061a33',
-        padding: 16,
-        display: 'flex',
-        justifyContent: 'center',
-      }}
-    >
-      <main
-        style={{
-          fontFamily: 'Arial, sans-serif',
-          width: '100%',
-          maxWidth: 980,
-          background: 'rgba(255,255,255,0.92)',
-          borderRadius: 16,
-          padding: 16,
-          boxShadow: '0 8px 28px rgba(0,0,0,0.25)',
-        }}
-      >
-        <h2 style={{ marginBottom: 6 }}>Mini App: BTC Guess ({ACTIVE.chainName})</h2>
+    <div style={{ minHeight: "100vh", padding: 14, fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial" }}>
+      <div style={{ maxWidth: 520, margin: "0 auto" }}>
+        <h2 style={{ margin: "6px 0 10px" }}>BaseUp — Guess BTC (k)</h2>
 
-        <div style={{ marginBottom: 10, color: '#444' }}>
-          Вводи число <b>{MIN_K}…{MAX_K}</b> (пример: <b>69</b> = <b>69k</b> = <b>$69,000</b>). Попыток на раунд:{' '}
-          <b>{MAX_ATTEMPTS}</b>
-        </div>
-
-        {/* PROFILE CARD */}
-        <div
-          style={{
-            marginBottom: 12,
-            display: 'flex',
-            alignItems: 'center',
-            gap: 12,
-            padding: 10,
-            border: '1px solid #e5e7eb',
-            borderRadius: 12,
-            background: '#fafbff',
-          }}
-        >
-          <div
-            style={{
-              width: 44,
-              height: 44,
-              borderRadius: '50%',
-              overflow: 'hidden',
-              border: '1px solid #e5e7eb',
-              background: '#fff',
-              flex: '0 0 44px',
-            }}
-          >
-            {profileAvatar ? (
-              <img src={profileAvatar} alt="avatar" style={{ width: '100%', height: '100%' }} />
-            ) : (
-              <div style={{ width: '100%', height: '100%', background: '#eef3f9' }} />
-            )}
+        <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 12, marginBottom: 12 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, justifyContent: "space-between", flexWrap: "wrap" }}>
+            <div style={{ fontWeight: 700 }}>{connected ? shortAddr(addr) : "Кошелёк не подключен"}</div>
+            <button
+              onClick={connectWallet}
+              style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #bbb", background: "#fff", cursor: "pointer" }}
+            >
+              {connected ? "Переподключить" : "Подключить"}
+            </button>
           </div>
 
-          <div style={{ lineHeight: 1.25, width: '100%' }}>
-            <div style={{ fontWeight: 700 }}>{profileName}</div>
-            <div style={{ fontSize: 12, color: '#666' }}>
-              {status}
-              {isConnected && !isCorrectChain ? ' · не та сеть' : ''}
+          {connected && (
+            <div style={{ marginTop: 8, color: "#333" }}>
+              <div style={{ fontSize: 13, opacity: 0.9 }}>Подключено</div>
+              <div style={{ fontSize: 13, opacity: 0.9 }}>{addr}</div>
+
+              <div style={{ marginTop: 8, color: "#b00000" }}>
+                <div style={{ fontWeight: 700 }}>Base Name:</div>
+                <div>{baseNameText}</div>
+              </div>
             </div>
-            <div style={{ fontSize: 12, color: '#8b8b8b', wordBreak: 'break-all' }}>{addr ? addr : '-'}</div>
-            {baseNameInfo ? <div style={{ fontSize: 12, color: '#8b0000', marginTop: 6 }}>{baseNameInfo}</div> : null}
-          </div>
+          )}
         </div>
 
-        {/* TECH INFO */}
-        <div style={{ marginBottom: 10 }}>
-          <div>
-            <b>ChainId:</b> {chainId ?? '-'}
-          </div>
-          <div style={{ wordBreak: 'break-all' }}>
-            <b>Контракт:</b> {CONTRACT_ADDRESS}
-          </div>
-        </div>
+        <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 12, marginBottom: 12 }}>
+          <div style={{ fontWeight: 700, marginBottom: 6 }}>Chain / Contract</div>
+          <div style={{ fontSize: 14 }}>ChainId: {chainId ?? "-"}</div>
+          <div style={{ fontSize: 14 }}>Контракт: {CONTRACT_ADDRESS}</div>
 
-        <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 14 }}>
-          {!isConnected && (
-            <button style={{ padding: '10px 14px' }} onClick={connectWallet} disabled={!hasProvider}>
-              Подключить кошелёк
-            </button>
-          )}
-
-          {isConnected && !isCorrectChain && (
-            <button style={{ padding: '10px 14px' }} onClick={switchToMainnet}>
-              Switch to Base Mainnet
-            </button>
-          )}
-
-          {isConnected && (
-            <button style={{ padding: '10px 14px' }} onClick={() => refreshBaseName(addr)}>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 10 }}>
+            <button
+              onClick={refreshBaseName}
+              style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #bbb", background: "#fff", cursor: "pointer" }}
+            >
               Обновить Base Name
             </button>
-          )}
 
-          <button style={{ padding: '10px 14px' }} onClick={resetRound}>
-            Новый раунд
-          </button>
-
-          <button
-            style={{ padding: '10px 14px' }}
-            onClick={saveOnchain}
-            disabled={!hasProvider || !lastWin || isSaving}
-            title={!lastWin ? 'Сначала выиграй раунд' : 'Записать победу onchain'}
-          >
-            {isSaving ? 'Сохраняю…' : 'Сохранить результат (onchain)'}
-          </button>
-        </div>
-
-        <div style={{ marginBottom: 10 }}>
-          <div style={{ marginBottom: 6 }}>
-            <b>Угадай уровень BTC (k):</b> введи <b>{MIN_K}…{MAX_K}</b>
-          </div>
-
-          <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
-            <input
-              value={inputRaw}
-              onChange={onInputChange}
-              inputMode="numeric"
-              placeholder="например 69"
-              style={{ width: 180, padding: '10px 12px', fontSize: 16 }}
-              maxLength={3}
-            />
-
-            <button style={{ padding: '10px 14px' }} onClick={guessNow}>
-              Проверить
+            <button
+              onClick={newRound}
+              style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #bbb", background: "#fff", cursor: "pointer" }}
+            >
+              Новый раунд
             </button>
 
-            <div style={{ color: '#333' }}>
-              {interpretedK !== null ? (
-                <span>
-                  Интерпретируется как <b>{interpretedLabel}</b> (<b>${interpretedUsd?.toLocaleString('en-US')}</b>)
-                </span>
-              ) : (
-                <span style={{ color: '#777' }}>Введите число (2–3 цифры)</span>
-              )}
-            </div>
+            <button
+              onClick={switchToBase}
+              style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #bbb", background: "#fff", cursor: "pointer" }}
+            >
+              Переключить на Base
+            </button>
+          </div>
+
+          <div style={{ marginTop: 10 }}>
+            <button
+              onClick={saveOnchain}
+              style={{
+                width: "100%",
+                padding: "12px 12px",
+                borderRadius: 10,
+                border: "1px solid #bbb",
+                background: "#fff",
+                cursor: "pointer",
+                fontWeight: 700,
+              }}
+            >
+              Сохранить результат (onchain)
+            </button>
           </div>
         </div>
 
-        <div style={{ marginBottom: 12 }}>
-          <b>Подсказка:</b> <span style={{ marginLeft: 8 }}>{hint || '-'}</span>
-        </div>
+        <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 12, marginBottom: 12 }}>
+          <div style={{ fontWeight: 800, marginBottom: 10 }}>Угадай уровень BTC (k): введи 60…120</div>
 
-        <div style={{ marginBottom: 12 }}>
-          <div>
-            Попыток (в этом раунде): <b>{attemptsThisRound}</b> / {MAX_ATTEMPTS}
+          <div style={{ display: "flex", gap: 10 }}>
+            <input
+              value={guess}
+              onChange={(e) => setGuess(e.target.value)}
+              placeholder="например 69"
+              inputMode="numeric"
+              style={{ flex: 1, padding: 12, borderRadius: 10, border: "1px solid #bbb" }}
+            />
+            <button
+              onClick={checkGuess}
+              style={{ padding: "12px 14px", borderRadius: 10, border: "1px solid #bbb", background: "#fff", cursor: "pointer" }}
+            >
+              Проверить
+            </button>
           </div>
-          <div>
-            Раунды: <b>{rounds}</b>
-          </div>
-          <div>
-            Победы: <b>{wins}</b>
-          </div>
-          <div>
-            Очки за последнюю победу: <b>{lastRoundScore}</b>
-          </div>
-          <div>
-            Лучший результат за раунд: <b>{bestRoundScore}</b>
-          </div>
-          <div>
-            Суммарные очки (total): <b>{totalScore}</b>
-          </div>
-        </div>
 
-        <div style={{ padding: 12, border: '1px solid #ddd', borderRadius: 10, marginBottom: 14 }}>
-          <div style={{ marginBottom: 6 }}>
-            <b>Последняя победа (для onchain):</b>
-          </div>
-          {lastWin ? (
-            <div>
-              <div>
-                guess: <b>{lastWin.guessK}k</b>
-              </div>
-              <div>
-                score: <b>{lastWin.score}</b>
-              </div>
-              <div style={{ wordBreak: 'break-all' }}>
-                saved tx: <b>{lastSavedTx ? lastSavedTx : '-'}</b>
-              </div>
-            </div>
-          ) : (
-            <div style={{ color: '#666' }}>Пока нет победы.</div>
-          )}
-        </div>
+          <div style={{ marginTop: 8, opacity: 0.75 }}>Введите число (2–3 цифры)</div>
 
-        {txMsg ? <div style={{ marginBottom: 8, color: '#0a4' }}>{txMsg}</div> : null}
-        {txHash ? (
-          <div style={{ marginBottom: 8, wordBreak: 'break-all' }}>
-            tx: <b>{txHash}</b>
+          <div style={{ marginTop: 10, fontWeight: 700 }}>Подсказка: <span style={{ fontWeight: 800 }}>{hint}</span></div>
+
+          <div style={{ marginTop: 10, lineHeight: 1.5 }}>
+            <div>Попыток (в этом раунде): <b>{Math.min(tries, attemptsMax)}</b> / <b>{attemptsMax}</b></div>
+            <div>Раунды: <b>{rounds}</b></div>
+            <div>Победы: <b>{wins}</b></div>
+            <div>Очки за последнюю победу: <b>{lastWinScore ?? "-"}</b></div>
+            <div>Лучший результат за раунд: <b>{bestRound}</b></div>
+            <div>Суммарные очки (total): <b>{totalPoints}</b></div>
           </div>
-        ) : null}
-        {err ? (
-          <div style={{ marginTop: 10, color: '#b00000', whiteSpace: 'pre-wrap' }}>
-            <b>Ошибка:</b> {err}
+
+          <div style={{ marginTop: 12, padding: 12, border: "1px solid #eee", borderRadius: 12, background: "#fafafa" }}>
+            <div style={{ fontWeight: 800, marginBottom: 6 }}>Последняя победа (для onchain):</div>
+            <div>guess: <b>{lastWinBlock.g}</b></div>
+            <div>score: <b>{lastWinBlock.s}</b></div>
+            <div>saved tx: <b>{savedTx}</b></div>
           </div>
-        ) : null}
-      </main>
+
+          {diag ? (
+            <div style={{ marginTop: 12, color: "#0a7a2f", fontWeight: 700 }}>Диагностика: {diag}</div>
+          ) : null}
+
+          {err ? (
+            <div style={{ marginTop: 12, color: "#b00000", fontWeight: 700 }}>Ошибка: {err}</div>
+          ) : null}
+        </div>
+      </div>
     </div>
   );
 }
