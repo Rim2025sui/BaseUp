@@ -20,7 +20,7 @@ export default function RootLayout({ children }) {
   return (
     <html lang="en">
       <head>
-        <meta name="base:app_id" content="697cb2c377db5d481cffc86f" />
+        <meta name="base:app_id" content="6980bf6ac6a03f3fe39cb89c" />
       </head>
       <body className={`${geistSans.variable} ${geistMono.variable}`}>
         {children}
